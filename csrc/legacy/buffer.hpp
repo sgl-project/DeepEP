@@ -1633,7 +1633,10 @@ public:
         bool zero_copy,
         bool async,
         bool return_recv_hook,
-        const std::optional<torch::Tensor>& out = std::nullopt) {
+        const std::optional<torch::Tensor>& out = std::nullopt,
+        bool overlap = false,
+        const std::optional<torch::Tensor>& src_signals = std::nullopt,
+        uint32_t src_signal_expect_value = 0) {
         EP_HOST_ASSERT(low_latency_mode);
 
         // Tensor checks
@@ -1716,7 +1719,10 @@ public:
                                   num_device_sms,
                                   launch_stream,
                                   phases,
-                                  zero_copy);
+                                  zero_copy,
+                                  overlap,
+                                  src_signals.has_value() ? src_signals->data_ptr<uint32_t>() : nullptr,
+                                  src_signal_expect_value);
         };
         launcher(return_recv_hook ? LEGACY_LOW_LATENCY_SEND_PHASE : (LEGACY_LOW_LATENCY_SEND_PHASE | LEGACY_LOW_LATENCY_RECV_PHASE));
 
