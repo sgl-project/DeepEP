@@ -34,6 +34,7 @@ class Buffer:
                  low_latency_mode: bool = False, num_qps_per_rank: int = 24,
                  allow_nvlink_for_low_latency_mode: bool = True,
                  allow_mnnvl: bool = False,
+                 use_fabric: bool = False,
                  explicitly_destroy: bool = False,
                  comm: Optional["mpi4py.MPI.Comm"] = None) -> None:
         """
@@ -51,6 +52,7 @@ class Buffer:
                 Warning: PCIe connections may lead to errors due to memory ordering issues,
                 please make sure all connections are via NVLink.
             allow_mnnvl: whether to allow MNNVL
+            use_fabric: whether to use fabric API for memory buffers.
             explicitly_destroy: If this flag is set to True, you need to explicitly call `destroy()` to release resources;
                 otherwise, the resources will be released by the destructor.
                 Note: Releasing resources in the destructor may cause Python's exception handling process to hang.
@@ -81,7 +83,8 @@ class Buffer:
         self.num_rdma_bytes = num_rdma_bytes
         self.low_latency_mode = low_latency_mode
         self.explicitly_destroy = explicitly_destroy
-        self.runtime = deep_ep_cpp.Buffer(self.rank, self.group_size, num_nvl_bytes, num_rdma_bytes, low_latency_mode, explicitly_destroy)
+        self.runtime = deep_ep_cpp.Buffer(self.rank, self.group_size, num_nvl_bytes, num_rdma_bytes,
+                                          low_latency_mode, explicitly_destroy, use_fabric)
 
         # Synchronize device IDs
         local_device_id = self.runtime.get_local_device_id()
