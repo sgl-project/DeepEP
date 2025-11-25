@@ -38,6 +38,7 @@ class Buffer:
                  num_qps_per_rank: int = 24,
                  allow_nvlink_for_low_latency_mode: bool = True,
                  allow_mnnvl: bool = False,
+                 use_fabric: Optional[bool] = None,
                  explicitly_destroy: bool = False,
                  enable_shrink: bool = False,
                  comm: Optional["mpi4py.MPI.Comm"] = None) -> None:  # noqa: F821
@@ -56,7 +57,6 @@ class Buffer:
                 Warning: PCIe connections may lead to errors due to memory ordering issues,
                 please make sure all connections are via NVLink.
             allow_mnnvl: whether to allow MNNVL
-            use_fabric: whether to use fabric API for memory buffers.
             enable_shrink: whether to enable shrink mode. The enable mode allocates a mask buffer to support masking ranks dynamically.
             explicitly_destroy: If this flag is set to True, you need to explicitly call `destroy()` to release resources;
                 otherwise, the resources will be released by the destructor.
