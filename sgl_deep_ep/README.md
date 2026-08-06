@@ -30,12 +30,46 @@ The wheel contains DeepEP's Python code and CUDA extension. It does not and
 cannot provision the host kernel or RDMA stack. Every host must provide:
 
 - a compatible NVIDIA driver and CUDA runtime;
-- the GDRCopy user-space library (`libgdrapi.so`);
-- the loaded GDRCopy kernel module and `/dev/gdrdrv` passed into the container;
 - the RDMA/NVLink environment required by the selected DeepEP transport.
 
 At import time, the package checks the supported platform, PyTorch and CUDA
-versions, CUDA driver/device availability, `libgdrapi`, and `/dev/gdrdrv`.
-Failures raise an actionable `ImportError`. Transport-specific RDMA and NVLink
-topology cannot be proven at import time and is validated when DeepEP
+versions, and CUDA driver/device availability. Failures raise an actionable
+`ImportError`. Transport-specific prerequisites are validated when DeepEP
 initializes the selected transport.
+
+Low-latency and internode transports require an IBGDA-capable host. This can be
+provided either by the NVIDIA driver configuration or by GDRCopy
+(`libgdrapi.so` plus a usable `/dev/gdrdrv`). See the
+[NVSHMEM setup guide](https://github.com/sgl-project/DeepEP/blob/sgl-deepep-packaging/docs/nvshmem.md)
+for both supported configurations.
+
+## Wheel release workflow
+
+Wheels are built and published by SGLang's
+[Release sgl-deep-ep workflow](https://github.com/sgl-project/sglang/actions/workflows/release-whl-deepep.yml).
+Before starting a release, merge the required implementation changes into the
+three platform branches (`sgl-deepep-x86`, `sgl-deepep-arm`, and
+`sgl-deepep-cu12-arm`) and merge the packaging overlay into
+`sgl-deepep-packaging`.
+
+Run the workflow manually with:
+
+- `version`: the public package version, without a leading `v`;
+- `target`: `cu129`, `cu130`, or `all`;
+- `packaging-ref`: the packaging overlay branch, tag, or commit (normally
+  `sgl-deepep-packaging`).
+
+The CUDA 12.9 matrix builds CPython 3.10 and 3.12 wheels. The CUDA 13.0 matrix
+builds CPython 3.10, 3.11, 3.12, and 3.13 wheels. Both matrices build for
+`x86_64` and `aarch64`.
+
+For each selected CUDA target, the workflow uploads CUDA-tagged wheels to the
+corresponding `cu129` or `cu130` index in
+[sgl-project/whl](https://github.com/sgl-project/whl). CUDA 13.0 wheels are also
+published to PyPI as `sgl-deep-ep`, without a CUDA suffix in the package name.
+Publishing requires the `GH_PAT_FOR_WHL_RELEASE` and
+`SGL_DEEP_EP_PYPI_TOKEN` repository secrets.
+
+After the workflow completes, check that every expected Python and architecture
+artifact was published, install the appropriate wheel in a clean environment,
+and verify both `import deep_ep` and a multi-GPU DeepEP or SGLang workload.
