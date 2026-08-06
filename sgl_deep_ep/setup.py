@@ -19,7 +19,7 @@ def _run_deepep_setup() -> None:
             for requirement in kwargs.get("install_requires") or []
             if not re.match(r"\s*torch(?:\s|[<>=!~;@\[]|$)", requirement, re.IGNORECASE)
         ]
-        requirements.append("torch==2.11.0")
+        requirements.append("torch==2.13.0")
 
         kwargs.update(
             name="sgl-deep-ep",
