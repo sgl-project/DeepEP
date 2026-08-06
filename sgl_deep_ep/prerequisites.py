@@ -1,6 +1,4 @@
-import ctypes
 import platform
-from pathlib import Path
 
 _README_URL = (
     "https://github.com/sgl-project/DeepEP/tree/sgl-deepep-packaging/sgl_deep_ep"
@@ -9,24 +7,6 @@ _README_URL = (
 
 def _failure(message: str) -> ImportError:
     return ImportError(f"{message}. See {_README_URL} for host prerequisites")
-
-
-def _check_gdrcopy() -> None:
-    last_error = None
-    for library_name in ("libgdrapi.so", "libgdrapi.so.2"):
-        try:
-            ctypes.CDLL(library_name, mode=ctypes.RTLD_GLOBAL)
-            return
-        except OSError as error:
-            last_error = error
-    raise _failure(
-        "GDRCopy user-space library libgdrapi.so is unavailable"
-    ) from last_error
-
-
-def _check_gdrdrv() -> None:
-    if not Path("/dev/gdrdrv").exists():
-        raise _failure("GDRCopy kernel device /dev/gdrdrv is unavailable")
 
 
 def check_prerequisites(*, expected_cuda_major: int) -> None:
@@ -58,6 +38,3 @@ def check_prerequisites(*, expected_cuda_major: int) -> None:
 
     if not torch.cuda.is_available():
         raise _failure("The NVIDIA driver does not expose a usable CUDA device")
-
-    _check_gdrcopy()
-    _check_gdrdrv()

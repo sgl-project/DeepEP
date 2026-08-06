@@ -30,12 +30,14 @@ The wheel contains DeepEP's Python code and CUDA extension. It does not and
 cannot provision the host kernel or RDMA stack. Every host must provide:
 
 - a compatible NVIDIA driver and CUDA runtime;
-- the GDRCopy user-space library (`libgdrapi.so`);
-- the loaded GDRCopy kernel module and `/dev/gdrdrv` passed into the container;
 - the RDMA/NVLink environment required by the selected DeepEP transport.
 
 At import time, the package checks the supported platform, PyTorch and CUDA
-versions, CUDA driver/device availability, `libgdrapi`, and `/dev/gdrdrv`.
-Failures raise an actionable `ImportError`. Transport-specific RDMA and NVLink
-topology cannot be proven at import time and is validated when DeepEP
+versions, and CUDA driver/device availability. Failures raise an actionable
+`ImportError`. Transport-specific prerequisites are validated when DeepEP
 initializes the selected transport.
+
+Low-latency and internode transports require an IBGDA-capable host. This can be
+provided either by the NVIDIA driver configuration or by GDRCopy
+(`libgdrapi.so` plus a usable `/dev/gdrdrv`). See the
+[NVSHMEM setup guide](../docs/nvshmem.md) for both supported configurations.
