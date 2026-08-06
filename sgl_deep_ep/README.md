@@ -40,4 +40,5 @@ initializes the selected transport.
 Low-latency and internode transports require an IBGDA-capable host. This can be
 provided either by the NVIDIA driver configuration or by GDRCopy
 (`libgdrapi.so` plus a usable `/dev/gdrdrv`). See the
-[NVSHMEM setup guide](../docs/nvshmem.md) for both supported configurations.
+[NVSHMEM setup guide](https://github.com/sgl-project/DeepEP/blob/sgl-deepep-packaging/docs/nvshmem.md)
+for both supported configurations.
