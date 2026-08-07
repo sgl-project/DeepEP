@@ -1,9 +1,28 @@
+import importlib.metadata
 import os
 import re
 import runpy
 from pathlib import Path
 
 import setuptools
+
+
+_OVERRIDDEN_REQUIREMENT = re.compile(
+    r"\s*(?:torch|pynvml|nvidia[-_.]ml[-_.]py)(?:\s|[<>=!~;@\[]|$)",
+    re.IGNORECASE,
+)
+
+
+def _installed_torch_requirement() -> str:
+    try:
+        installed_version = importlib.metadata.version("torch")
+    except importlib.metadata.PackageNotFoundError as exc:
+        raise RuntimeError(
+            "PyTorch must be installed before building sgl-deep-ep"
+        ) from exc
+
+    public_version = installed_version.partition("+")[0]
+    return f"torch=={public_version}"
 
 
 def _run_deepep_setup() -> None:
@@ -17,9 +36,9 @@ def _run_deepep_setup() -> None:
         requirements = [
             requirement
             for requirement in kwargs.get("install_requires") or []
-            if not re.match(r"\s*torch(?:\s|[<>=!~;@\[]|$)", requirement, re.IGNORECASE)
+            if not _OVERRIDDEN_REQUIREMENT.match(requirement)
         ]
-        requirements.append("torch==2.13.0")
+        requirements.extend(["nvidia-ml-py", _installed_torch_requirement()])
 
         kwargs.update(
             name="sgl-deep-ep",
