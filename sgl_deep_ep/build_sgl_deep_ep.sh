@@ -7,8 +7,8 @@ usage() {
 Usage: build_sgl_deep_ep.sh <deepep-source> <packaging-overlay> <output-dir> <cuda-version> <architecture>
 
 Build an sgl-deep-ep wheel from one DeepEP implementation branch plus the
-shared packaging overlay. Dependencies, including PyTorch and GDRCopy, must
-already be installed in the build environment.
+shared packaging overlay. Build dependencies, including PyTorch, must already
+be installed. CUDA 12 builds additionally require GDRCopy.
 EOF
 }
 
@@ -134,7 +134,11 @@ cat "${ORIGINAL_INIT}" >>"${GUARDED_INIT}"
 mv "${GUARDED_INIT}" "${ORIGINAL_INIT}"
 
 export CUDA_HOME
-export GDRCOPY_HOME="${GDRCOPY_HOME:-/usr/local}"
+if [[ "${CUDA_MAJOR}" == 12 ]]; then
+    export GDRCOPY_HOME="${GDRCOPY_HOME:-/usr/local}"
+else
+    unset GDRCOPY_HOME
+fi
 export MAX_JOBS="${MAX_JOBS:-8}"
 export SGL_DEEP_EP_VERSION="${PUBLIC_VERSION}+${CUDA_TAG}"
 export TORCH_CUDA_ARCH_LIST="9.0;10.0;10.3"

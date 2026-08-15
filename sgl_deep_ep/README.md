@@ -37,9 +37,14 @@ versions, and CUDA driver/device availability. Failures raise an actionable
 `ImportError`. Transport-specific prerequisites are validated when DeepEP
 initializes the selected transport.
 
-Low-latency and internode transports require an IBGDA-capable host. This can be
-provided either by the NVIDIA driver configuration or by GDRCopy
-(`libgdrapi.so` plus a usable `/dev/gdrdrv`). See the
+CUDA 13 wheels use DeepEP v2 and its NCCL Gin transport. Release and runtime
+images pin `nvidia-nccl-cu13==2.30.7`; this path does not require GDRCopy or a
+`/dev/gdrdrv` device. NVSHMEM remains a build and runtime dependency because the
+current v2 extension still links the legacy DeepEP methods.
+
+CUDA 12.9 wheels use the legacy NVSHMEM transport. Their low-latency and
+internode paths require an IBGDA-capable host, provided either by NVIDIA driver
+configuration or by GDRCopy (`libgdrapi.so` plus a usable `/dev/gdrdrv`). See the
 [NVSHMEM setup guide](https://github.com/sgl-project/DeepEP/blob/sgl-deepep-packaging/docs/nvshmem.md)
 for both supported configurations.
 
@@ -48,9 +53,12 @@ for both supported configurations.
 Wheels are built and published by SGLang's
 [Release sgl-deep-ep workflow](https://github.com/sgl-project/sglang/actions/workflows/release-whl-deepep.yml).
 Before starting a release, merge the required implementation changes into the
-three platform branches (`sgl-deepep-x86`, `sgl-deepep-arm`, and
-`sgl-deepep-cu12-arm`) and merge the packaging overlay into
-`sgl-deepep-packaging`.
+matching implementation branch and merge the packaging overlay into
+`sgl-deepep-packaging`:
+
+- CUDA 13, x86_64 and aarch64: `sgl-deepep` (DeepEP v2);
+- CUDA 12.9, x86_64: `sgl-deepep-cu12-x86`;
+- CUDA 12.9, aarch64: `sgl-deepep-cu12-arm`.
 
 Run the workflow manually with:
 
