@@ -3,18 +3,19 @@
 #include <deep_ep/common/compiled.cuh>
 #include <deep_ep/common/layout.cuh>
 #include <deep_ep/common/math.cuh>
+#include <deep_ep/common/nvfp4.cuh>
 #include <deep_ep/common/ptx.cuh>
 
 
 namespace deep_ep::elastic {
 
-template <bool kDoExpand, bool kCachedMode, bool kDoZeroPadding,
+template <bool kDoExpand, bool kCachedMode, bool kDoZeroPadding, bool kUseNVFP4, bool kAFD,
           // NOTES: this channel concept only applies for scale-out ranks
           int kNumSMs, int kNumChannels, int kNumWarps,
           int kNumScaleoutRanks, int kNumScaleupRanks,
           int kNumHiddenBytes, int kNumSFPacks,
           int kNumMaxTokensPerRank,
-          int kNumExperts, int kNumTopk, int kExpertAlignment,
+          int kNumExperts, int kNumTopk, int kExpertAlignment, int kExpertCapacity,
           int kNumRanks = kNumScaleoutRanks * kNumScaleupRanks,
           int kNumThreads = kNumWarps * 32,
           int kNumMaxTokensPerChannel = math::constexpr_ceil_div(kNumMaxTokensPerRank, kNumChannels),
@@ -38,6 +39,7 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
 
     // For top-k index transformations
     constexpr int kNumExpertsPerRank = kNumExperts / kNumRanks;
+    EP_STATIC_ASSERT(not kUseNVFP4 or kExpertCapacity > 0, "Invalid NVFP4 expert capacity");
     const auto rank_idx = scaleout_rank_idx * kNumScaleupRanks + scaleup_rank_idx;
     const auto expert_start_idx = kNumExpertsPerRank * rank_idx, expert_end_idx = kNumExpertsPerRank * (rank_idx + 1);
 
@@ -62,6 +64,10 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
     // For no CPU sync case, the number of received tokens should be read from the GPU tensor
     if (num_recv_tokens == kNumMaxTokensPerRank * kNumRanks)
         num_recv_tokens = psum_num_recv_tokens_per_scaleup_rank[kNumScaleupRanks - 1];
+    else if constexpr (kAFD) {
+        if (num_recv_tokens == 0)
+            EP_DEVICE_ASSERT(psum_num_recv_tokens_per_scaleup_rank[kNumScaleupRanks - 1] == 0);
+    }
 
     // Current rank indices should be maintained
     int current_rank_idx = -1, stored_psum_num_recv_tokens;
@@ -143,7 +149,10 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
         __syncwarp();
 
         // Store SF
-        if constexpr (kNumSFPacks > 0) {
+        if constexpr (kNumSFPacks > 0 and kUseNVFP4) {
+            nvfp4::store_expert_scales<kNumSFPacks, kExpertCapacity>(
+                tma_buffer.get_sf_ptr(), recv_sf, dst_tensor_idx, lane_idx);
+        } else if constexpr (kNumSFPacks > 0) {
             constexpr auto kNumFullIters = kNumSFPacks / 32;
             const bool do_last_iter = (kNumSFPacks % 32 != 0) and (kNumFullIters * 32 + lane_idx < kNumSFPacks);
             EP_STATIC_ASSERT(sizeof(sf_pack_t) % 4 == 0, "Unaligned SF element type");
