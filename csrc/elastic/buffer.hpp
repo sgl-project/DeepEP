@@ -1303,6 +1303,63 @@ public:
             const bool& async_with_compute_stream,
             const bool& allocate_on_comm_stream,
             const bool& use_expanded_layout) const {
+        return combine_impl(
+            x, topk_weights, bias_0, bias_1,
+            src_metadata, combined_topk_idx, psum_num_recv_tokens_per_scaleup_rank, token_metadata_at_forward,
+            channel_linked_list, num_experts, num_max_tokens_per_rank, num_sms,
+            num_qps, previous_event, previous_event_before_epilogue, async_with_compute_stream,
+            allocate_on_comm_stream, use_expanded_layout,
+            1.0f, false);
+    }
+
+    std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>>
+    combine_afd(const torch::Tensor& x,
+            const std::optional<torch::Tensor>& topk_weights,
+            const std::optional<torch::Tensor>& bias_0,
+            const std::optional<torch::Tensor>& bias_1,
+            const torch::Tensor& src_metadata,
+            const torch::Tensor& combined_topk_idx,
+            const torch::Tensor& psum_num_recv_tokens_per_scaleup_rank,
+            const std::optional<torch::Tensor>& token_metadata_at_forward,
+            const std::optional<torch::Tensor>& channel_linked_list,
+            const int& num_experts,
+            const int& num_max_tokens_per_rank,
+            const int& num_sms, const int& num_qps,
+            const std::optional<EventHandle>& previous_event,
+            const std::optional<EventHandle>& previous_event_before_epilogue,
+            const bool& async_with_compute_stream,
+            const bool& allocate_on_comm_stream,
+            const bool& use_expanded_layout,
+            const float& routed_scaling_factor) const {
+        return combine_impl(
+            x, topk_weights, bias_0, bias_1,
+            src_metadata, combined_topk_idx, psum_num_recv_tokens_per_scaleup_rank, token_metadata_at_forward,
+            channel_linked_list, num_experts, num_max_tokens_per_rank, num_sms,
+            num_qps, previous_event, previous_event_before_epilogue, async_with_compute_stream,
+            allocate_on_comm_stream, use_expanded_layout,
+            routed_scaling_factor, use_expanded_layout and topk_weights.has_value());
+    }
+
+    std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>>
+    combine_impl(const torch::Tensor& x,
+            const std::optional<torch::Tensor>& topk_weights,
+            const std::optional<torch::Tensor>& bias_0,
+            const std::optional<torch::Tensor>& bias_1,
+            const torch::Tensor& src_metadata,
+            const torch::Tensor& combined_topk_idx,
+            const torch::Tensor& psum_num_recv_tokens_per_scaleup_rank,
+            const std::optional<torch::Tensor>& token_metadata_at_forward,
+            const std::optional<torch::Tensor>& channel_linked_list,
+            const int& num_experts,
+            const int& num_max_tokens_per_rank,
+            const int& num_sms, const int& num_qps,
+            const std::optional<EventHandle>& previous_event,
+            const std::optional<EventHandle>& previous_event_before_epilogue,
+            const bool& async_with_compute_stream,
+            const bool& allocate_on_comm_stream,
+            const bool& use_expanded_layout,
+            const float& routed_scaling_factor,
+            const bool& apply_weights) const {
         // Check SM count
         EP_HOST_ASSERT(num_sms > 0);
 
@@ -1394,6 +1451,7 @@ public:
         const auto reduce_buffer = launch_combine(
             x.data_ptr(),
             topk_weights.has_value() ? topk_weights->data_ptr() : nullptr,
+            routed_scaling_factor, apply_weights,
             src_metadata.data_ptr<int>(),
             psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
             token_metadata_at_forward_ptr,
@@ -1415,7 +1473,7 @@ public:
         auto combined_x = torch::empty({num_combined_tokens, hidden}, x.options());
         auto combined_topk_weights = std::optional<torch::Tensor>();
         float* combined_topk_weights_ptr = nullptr;
-        if (topk_weights.has_value()) {
+        if (topk_weights.has_value() and not apply_weights) {
             combined_topk_weights = torch::empty({num_combined_tokens, num_topk}, topk_weights->options());
             combined_topk_weights_ptr = combined_topk_weights->data_ptr<float>();
         }
@@ -1473,7 +1531,8 @@ static void register_apis(pybind11::module_& m) {
         .def("all_gather", &ElasticBuffer::all_gather)
         .def("dispatch", &ElasticBuffer::dispatch)
         .def("combine", &ElasticBuffer::combine)
-        .def("dispatch_afd", &ElasticBuffer::dispatch_impl<true>);
+        .def("dispatch_afd", &ElasticBuffer::dispatch_impl<true>)
+        .def("combine_afd", &ElasticBuffer::combine_afd);
     m.def("create_cpu_handle", &ElasticBuffer::create_cpu_handle);
     m.def("calculate_elastic_buffer_size", &ElasticBuffer::calculate_buffer_size);
     m.def("get_elastic_buffer_alignment", [=]() {

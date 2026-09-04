@@ -8,7 +8,7 @@
 
 namespace deep_ep::elastic {
 
-template <bool kUseExpandedLayout, bool kAllowMultipleReduction,
+template <bool kUseExpandedLayout, bool kAllowMultipleReduction, bool kApplyWeights,
           int kNumSMs,
           int kNumScaleupWarps, int kNumForwardWarps,
           int kNumScaleoutRanks, int kNumScaleupRanks,
@@ -32,6 +32,7 @@ template <bool kUseExpandedLayout, bool kAllowMultipleReduction,
 __global__ void __launch_bounds__(kNumThreads, 1)
 hybrid_combine_impl(nv_bfloat16* x,
                     float* topk_weights,
+                    const float routed_scaling_factor,
                     int* src_metadata,
                     int* psum_num_recv_tokens_per_scaleup_rank,
                     int* token_metadata_at_forward,
@@ -115,7 +116,7 @@ hybrid_combine_impl(nv_bfloat16* x,
             scaleup_buffer = scaleup_buffer.get_rank_buffer(scaleup_rank_idx);
 
         // Expanding send mode must not be backward
-        if constexpr (kDoExpandedSend)
+        if constexpr (kDoExpandedSend and not kApplyWeights)
             EP_DEVICE_ASSERT(topk_weights == nullptr);
 
         // Tail issuer
@@ -232,8 +233,8 @@ hybrid_combine_impl(nv_bfloat16* x,
                 //  - expand + send all
                 auto reduce_valid_mask = ptx::gather(stored_topk_slot_idx >= 0);
                 auto no_local_reduce = not kUseExpandedLayout or (kAllowMultipleReduction and __popc(reduce_valid_mask) == 1);
+                int token_idx_in_tensor = token_idx;
                 if (no_local_reduce) {
-                    int token_idx_in_tensor = token_idx;
                     if constexpr (kUseExpandedLayout)
                         token_idx_in_tensor = ptx::exchange(stored_topk_slot_idx, ptx::get_master_lane_idx(reduce_valid_mask));
 
@@ -258,7 +259,7 @@ hybrid_combine_impl(nv_bfloat16* x,
 
                     // Reduce into shared memory
                     constexpr int kUnrollFactor = get_max_unroll_factor<kHiddenVec, 4>();
-                    combine_reduce<kHiddenVec, kUnrollFactor, math::constexpr_ceil_div(kNumTopk, kNumRanks)>(
+                    combine_reduce<kHiddenVec, kUnrollFactor, math::constexpr_ceil_div(kNumTopk, kNumRanks), kApplyWeights>(
                         lane_idx, topk_slot_idx, static_cast<combine_vec_t*>(tma_buffer.get_base_ptr()),
                         /* Get source base */ [=](const int& slot_idx) {
                             return math::advance_ptr<combine_vec_t>(
@@ -267,7 +268,9 @@ hybrid_combine_impl(nv_bfloat16* x,
                         /* Wait buffer release */ [=]() {
                             ptx::tma_store_wait();
                             __syncwarp();
-                        }
+                        },
+                        static_cast<combine_vec_t*>(nullptr), static_cast<combine_vec_t*>(nullptr),
+                        topk_weights, routed_scaling_factor
                     );
                     ptx::tma_store_fence();
                     __syncwarp();
@@ -279,15 +282,27 @@ hybrid_combine_impl(nv_bfloat16* x,
                         if (topk_slot_idx < 0)
                             continue;
 
+                        if constexpr (kApplyWeights) {
+                            if (ptx::elect_one_sync()) {
+                                const auto load_ptr = math::advance_ptr(x, static_cast<int64_t>(kDoExpandedSend ? topk_slot_idx : token_idx) * kNumHiddenBytes);
+                                ptx::tma_store_wait();
+                                ptx::tma_load_1d(tma_buffer.get_base_ptr(), load_ptr, mbarrier_ptr, kNumHiddenBytes);
+                                ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, kNumHiddenBytes);
+                                ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
+                            }
+                            scale_combine_buffer<kHiddenVec>(
+                                lane_idx, static_cast<combine_vec_t*>(tma_buffer.get_base_ptr()),
+                                __ldg(topk_weights + topk_slot_idx), routed_scaling_factor);
+                        }
                         if (ptx::elect_one_sync()) {
-                            // Load
-                            const auto load_ptr = math::advance_ptr(x, static_cast<int64_t>(kDoExpandedSend ? topk_slot_idx : token_idx) * kNumHiddenBytes);
-                            ptx::tma_store_wait();
-                            ptx::tma_load_1d(tma_buffer.get_base_ptr(), load_ptr, mbarrier_ptr, kNumHiddenBytes);
-                            ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, kNumHiddenBytes);
-                            ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
-                            // NOTES: We don't need to care about `topk_weights` since we are in expand mode
-
+                            if constexpr (not kApplyWeights) {
+                                // Load
+                                const auto load_ptr = math::advance_ptr(x, static_cast<int64_t>(kDoExpandedSend ? topk_slot_idx : token_idx) * kNumHiddenBytes);
+                                ptx::tma_store_wait();
+                                ptx::tma_load_1d(tma_buffer.get_base_ptr(), load_ptr, mbarrier_ptr, kNumHiddenBytes);
+                                ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, kNumHiddenBytes);
+                                ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
+                            }
                             // Store
                             const auto dst_token_buffer = scaleup_buffer
                                 .get_rank_buffer(k)
@@ -302,7 +317,7 @@ hybrid_combine_impl(nv_bfloat16* x,
                 }
 
                 // Write top-k weights (expanded send handled inside the loop above)
-                if (not kDoExpandedSend and topk_weights != nullptr and lane_idx < kNumTopk) {
+                if (not kApplyWeights and not kDoExpandedSend and topk_weights != nullptr and lane_idx < kNumTopk) {
                     float value = 0;
                     if constexpr (kUseExpandedLayout) {
                         if (stored_topk_slot_idx >= 0)
@@ -317,18 +332,32 @@ hybrid_combine_impl(nv_bfloat16* x,
 
                 // Issue TMA stores into remote scale-up buffer
                 // NOTES: `kDoExpandedSend` mode has already issued
-                if (not kDoExpandedSend and ptx::elect_one_sync()) {
-                    // Wait TMA arrival (only for non-reduced cases)
-                    if (no_local_reduce) {
-                        ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, kNumHiddenBytes);
-                        ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
+                if (not kDoExpandedSend) {
+                    if constexpr (kApplyWeights) {
+                        if (no_local_reduce and ptx::elect_one_sync()) {
+                            ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, kNumHiddenBytes);
+                            ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
+                        }
+                        if (no_local_reduce) {
+                            scale_combine_buffer<kHiddenVec>(
+                                lane_idx, static_cast<combine_vec_t*>(tma_buffer.get_base_ptr()),
+                                __ldg(topk_weights + token_idx_in_tensor), routed_scaling_factor);
+                        }
                     }
-
                     // Issue stores
-                    ptx::tma_store_1d(
-                        token_buffer.get_base_ptr(), tma_buffer.get_base_ptr(),
-                        token_layout.get_num_bytes<false>());
-                    ptx::tma_store_commit();
+                    if (ptx::elect_one_sync()) {
+                        if constexpr (not kApplyWeights) {
+                            // Wait TMA arrival (only for non-reduced cases)
+                            if (no_local_reduce) {
+                                ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, kNumHiddenBytes);
+                                ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
+                            }
+                        }
+                        ptx::tma_store_1d(
+                            token_buffer.get_base_ptr(), tma_buffer.get_base_ptr(),
+                            token_layout.get_num_bytes<false>());
+                        ptx::tma_store_commit();
+                    }
                 }
                 #pragma unroll
                 for (int j = 0; j < kNumScaleupRanksPerLane; ++ j)
@@ -533,7 +562,7 @@ hybrid_combine_impl(nv_bfloat16* x,
                 // NOTES: the slot indices must follow the master lane
                 stored_src_buffer_idx = ptx::exchange(
                     stored_src_buffer_idx, ptx::get_master_lane_idx(ptx::match(stored_src_scaleup_rank_idx)));
-                if (stored_src_scaleup_rank_idx >= 0) {
+                if (not kApplyWeights and stored_src_scaleup_rank_idx >= 0) {
                     tma_buffer.get_topk_weights_ptr()[lane_idx] =
                         scaleup_buffer.get_token_buffer(stored_src_buffer_idx, true)
                                     .get_topk_weights_ptr()[lane_idx];
