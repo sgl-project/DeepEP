@@ -79,11 +79,15 @@ NCCLSymmetricMemoryContext::NCCLSymmetricMemoryContext(const int64_t& nccl_comm,
     if (get_env<int>("EP_BUFFER_DEBUG"))
         printf("EP NCCL device communicator has %d allocated QPs\n", num_allocated_qps);
 
+    const auto physical_domain_size = get_physical_domain_size(nccl_comm);
+    const bool enable_gin = std::get<0>(physical_domain_size) > 1 and get_env("EP_DISABLE_GIN", 0) == 0;
+
     // Initialize NCCL device communicator
     ncclCommProperties props = NCCL_COMM_PROPERTIES_INITIALIZER;
     NCCL_CHECK(ncclCommQueryProperties(comm, &props));
     ncclDevCommRequirements_t reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
-    if (num_ranks > 1 and get_env("EP_DISABLE_GIN", 0) == 0) {
+    if (enable_gin) {
+        // GIN is only needed when the communicator spans multiple LSA domains.
         EP_HOST_ASSERT(
             (allow_hybrid_mode ? props.railedGinType : props.ginType) != NCCL_GIN_TYPE_NONE and
             "NCCL GIN is unavailable. This is usually due to a network configuration issue, "
