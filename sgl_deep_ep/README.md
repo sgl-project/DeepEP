@@ -42,12 +42,6 @@ images pin `nvidia-nccl-cu13==2.30.7`; this path does not require GDRCopy or a
 `/dev/gdrdrv` device. NVSHMEM remains a build and runtime dependency because the
 current v2 extension still links the legacy DeepEP methods.
 
-CUDA 12.9 wheels use the legacy NVSHMEM transport. Their low-latency and
-internode paths require an IBGDA-capable host, provided either by NVIDIA driver
-configuration or by GDRCopy (`libgdrapi.so` plus a usable `/dev/gdrdrv`). See the
-[NVSHMEM setup guide](https://github.com/sgl-project/DeepEP/blob/sgl-deepep-packaging/docs/nvshmem.md)
-for both supported configurations.
-
 ## Wheel release workflow
 
 Wheels are built and published by SGLang's
@@ -56,23 +50,17 @@ Before starting a release, merge the required implementation changes into the
 matching implementation branch and merge the packaging overlay into
 `sgl-deepep-packaging`:
 
-- CUDA 13, x86_64 and aarch64: `sgl-deepep` (DeepEP v2);
-- CUDA 12.9, x86_64: `sgl-deepep-cu12-x86`;
-- CUDA 12.9, aarch64: `sgl-deepep-cu12-arm`.
+- CUDA 13, x86_64 and aarch64: `sgl-deepep` (DeepEP v2)
 
 Run the workflow manually with:
 
 - `version`: the public package version, without a leading `v`;
-- `target`: `cu129`, `cu130`, or `all`;
+- `target`: `all`;
 - `packaging-ref`: the packaging overlay branch, tag, or commit (normally
   `sgl-deepep-packaging`).
 
-The CUDA 12.9 matrix builds CPython 3.10 and 3.12 wheels. The CUDA 13.0 matrix
-builds CPython 3.10, 3.11, 3.12, and 3.13 wheels. Both matrices build for
-`x86_64` and `aarch64`.
 
-For each selected CUDA target, the workflow uploads CUDA-tagged wheels to the
-corresponding `cu129` or `cu130` index in
+For each selected CUDA target, the workflow uploads CUDA-tagged wheels to the `cu130` index in
 [sgl-project/whl](https://github.com/sgl-project/whl). CUDA 13.0 wheels are also
 published to PyPI as `sgl-deep-ep`, without a CUDA suffix in the package name.
 Publishing requires the `GH_PAT_FOR_WHL_RELEASE` and
