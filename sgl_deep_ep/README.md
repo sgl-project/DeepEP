@@ -16,11 +16,6 @@ The PyPI package targets CUDA 13 and installs with:
 pip install sgl-deep-ep
 ```
 
-CUDA 12.9 wheels are published separately in the
-[SGLang wheel repository](https://github.com/sgl-project/whl). Install the
-matching PyTorch CUDA 12.9 build first, then install the wheel from the `cu129`
-index or release URL.
-
 Each wheel is specific to a CPython version, CPU architecture, and CUDA major.
 The package checks these constraints when `deep_ep` is imported.
 
@@ -38,9 +33,8 @@ versions, and CUDA driver/device availability. Failures raise an actionable
 initializes the selected transport.
 
 CUDA 13 wheels use DeepEP v2 and its NCCL Gin transport. Release and runtime
-images pin `nvidia-nccl-cu13==2.30.7`; this path does not require GDRCopy or a
-`/dev/gdrdrv` device. NVSHMEM remains a build and runtime dependency because the
-current v2 extension still links the legacy DeepEP methods.
+images pin `nvidia-nccl-cu13==2.30.7`. NVSHMEM remains a build and runtime
+dependency because the current v2 extension still links the legacy DeepEP methods.
 
 ## Wheel release workflow
 
@@ -81,12 +75,12 @@ cd DeepEP
 SGL_DEEP_EP_VERSION=0.1.3 bash sgl_deep_ep/build_sgl_deep_ep.sh dist 13.0 x86_64
 ```
 
-The arguments are the output directory, CUDA version (`12.9`, `13.0`, or
-`13.4`), and CPU architecture (`x86_64` or `aarch64`). Use the CUDA version and
+The arguments are the output directory, CUDA version (`13.0` or `13.4`), and
+CPU architecture (`x86_64` or `aarch64`). Use the CUDA version and
 architecture of the build environment. The script reads implementation and
 packaging from its own checkout, stages a temporary copy, and leaves the source
 unchanged. `SGL_DEEP_EP_VERSION` overrides `sgl_deep_ep/VERSION`; the wheel
-version includes the corresponding `+cu129`, `+cu130`, or `+cu134` suffix.
+version includes the corresponding `+cu130` or `+cu134` suffix.
 `PYTHON_BIN` selects the build interpreter and `MAX_JOBS` controls parallelism.
 
 This produces a native Linux wheel. The SGLang release build script applies

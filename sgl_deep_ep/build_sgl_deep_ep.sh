@@ -6,9 +6,8 @@ usage() {
     cat <<'EOF'
 Usage: build_sgl_deep_ep.sh <output-dir> <cuda-version> <architecture>
 
-Build an sgl-deep-ep wheel from the checkout containing this script.
+Build a CUDA 13 sgl-deep-ep wheel from the checkout containing this script.
 Build dependencies, including PyTorch, must already be installed.
-CUDA 12 builds additionally require GDRCopy.
 EOF
 }
 
@@ -25,20 +24,14 @@ ARCHITECTURE="$3"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
 case "${CUDA_VERSION}" in
-    12.9|12.9.*)
-        CUDA_MAJOR=12
-        CUDA_TAG=cu129
-        ;;
     13.0|13.0.*)
-        CUDA_MAJOR=13
         CUDA_TAG=cu130
         ;;
     13.4|13.4.*)
-        CUDA_MAJOR=13
         CUDA_TAG=cu134
         ;;
     *)
-        echo "Unsupported CUDA version: ${CUDA_VERSION}; expected 12.9, 13.0, or 13.4" >&2
+        echo "Unsupported CUDA version: ${CUDA_VERSION}; expected 13.0 or 13.4" >&2
         exit 2
         ;;
 esac
@@ -87,16 +80,14 @@ if [[ ! -d "${CUDA_HOME}" ]]; then
     exit 1
 fi
 
-if [[ "${CUDA_MAJOR}" == 13 ]]; then
-    CCCL_INCLUDE_DIR="${CUDA_HOME}/include/cccl"
-    if [[ ! -d "${CCCL_INCLUDE_DIR}" ]]; then
-        echo "CUDA 13 CCCL headers were not found at ${CCCL_INCLUDE_DIR}" >&2
-        exit 1
-    fi
-    export CPATH="${CCCL_INCLUDE_DIR}${CPATH:+:${CPATH}}"
-    export CPLUS_INCLUDE_PATH="${CCCL_INCLUDE_DIR}${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}}"
-    export NVCC_PREPEND_FLAGS="-I${CCCL_INCLUDE_DIR}${NVCC_PREPEND_FLAGS:+ ${NVCC_PREPEND_FLAGS}}"
+CCCL_INCLUDE_DIR="${CUDA_HOME}/include/cccl"
+if [[ ! -d "${CCCL_INCLUDE_DIR}" ]]; then
+    echo "CUDA 13 CCCL headers were not found at ${CCCL_INCLUDE_DIR}" >&2
+    exit 1
 fi
+export CPATH="${CCCL_INCLUDE_DIR}${CPATH:+:${CPATH}}"
+export CPLUS_INCLUDE_PATH="${CCCL_INCLUDE_DIR}${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}}"
+export NVCC_PREPEND_FLAGS="-I${CCCL_INCLUDE_DIR}${NVCC_PREPEND_FLAGS:+ ${NVCC_PREPEND_FLAGS}}"
 
 if [[ -n "${SGL_DEEP_EP_VERSION:-}" ]]; then
     PUBLIC_VERSION="${SGL_DEEP_EP_VERSION}"
@@ -129,7 +120,7 @@ cp "${PACKAGING_DIR}/LICENSE" "${STAGING_DIR}/LICENSE"
 cp "${PACKAGING_DIR}/prerequisites.py" "${STAGING_DIR}/deep_ep/prerequisites.py"
 
 cat >"${STAGING_DIR}/deep_ep/_build_info.py" <<EOF
-EXPECTED_CUDA_MAJOR = ${CUDA_MAJOR}
+EXPECTED_CUDA_MAJOR = 13
 CUDA_TAG = "${CUDA_TAG}"
 EOF
 
@@ -141,11 +132,6 @@ cat "${ORIGINAL_INIT}" >>"${GUARDED_INIT}"
 mv "${GUARDED_INIT}" "${ORIGINAL_INIT}"
 
 export CUDA_HOME
-if [[ "${CUDA_MAJOR}" == 12 ]]; then
-    export GDRCOPY_HOME="${GDRCOPY_HOME:-/usr/local}"
-else
-    unset GDRCOPY_HOME
-fi
 export MAX_JOBS="${MAX_JOBS:-8}"
 export SGL_DEEP_EP_VERSION="${PUBLIC_VERSION}+${CUDA_TAG}"
 export TORCH_CUDA_ARCH_LIST="9.0;10.0;10.3"
