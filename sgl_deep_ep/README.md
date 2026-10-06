@@ -93,9 +93,3 @@ This produces a native Linux wheel. The SGLang release build script applies
 `auditwheel repair` for manylinux and creates the public-version PyPI wheel.
 The CUDA 13.4 image also uses this entry point; the release workflow currently
 publishes CUDA 13.0 wheels only.
-
-The staging/metadata regression test requires setuptools and wheel but no GPU:
-
-```bash
-python tests/test_packaging.py
-```

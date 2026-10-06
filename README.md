@@ -102,10 +102,6 @@ python tests/elastic/test_pp.py
 
 ### Installation
 
-For SGLang's `sgl-deep-ep` wheels and release builds, see the
-[packaging guide](sgl_deep_ep/README.md). The packaging scripts and DeepEP
-implementation live together on the `sgl-deepep` branch.
-
 ```bash
 python setup.py install
 ```
