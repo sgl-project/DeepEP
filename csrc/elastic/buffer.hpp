@@ -91,7 +91,8 @@ public:
                   const int& num_cpu_timeout_secs, const int& num_gpu_timeout_secs,
                   const bool& explicitly_destroy,
                   const bool& source_only = false,
-                  const bool& dedicated_comm_stream = false):
+                  const bool& dedicated_comm_stream = false,
+                  const bool& allow_nvlink_without_gin = false):
         num_buffer_bytes(num_buffer_bytes),
         num_cpu_buffer_bytes(num_cpu_buffer_bytes),
         explicitly_destroy(explicitly_destroy),
@@ -117,7 +118,7 @@ public:
         this->nccl_context = std::make_shared<nccl::NCCLSymmetricMemoryContext>(
             nccl_comm, cpu_comm, num_ranks, rank_idx,
             num_sym_bytes, num_cpu_buffer_bytes,
-            allow_hybrid_mode, sl_idx, num_allocated_qps);
+            allow_hybrid_mode, sl_idx, num_allocated_qps, allow_nvlink_without_gin);
 
         // Verify the symmetric memory layout matches our expectations
         EP_HOST_ASSERT(num_workspace_bytes + num_gpu_buffer_bytes == nccl_context->num_gpu_bytes);
@@ -1513,7 +1514,7 @@ public:
 static void register_apis(pybind11::module_& m) {
     pybind11::class_<ElasticBuffer>(m, "ElasticBuffer")
         .def(pybind11::init<int, int, int64_t, symmetric::cpu_comm_t, int64_t, int64_t, bool, bool, bool, int, int, int, int, bool>())
-        .def(pybind11::init<int, int, int64_t, symmetric::cpu_comm_t, int64_t, int64_t, bool, bool, bool, int, int, int, int, bool, bool, bool>())
+        .def(pybind11::init<int, int, int64_t, symmetric::cpu_comm_t, int64_t, int64_t, bool, bool, bool, int, int, int, int, bool, bool, bool, bool>())
         .def("destroy", &ElasticBuffer::destroy)
         .def("get_comm_stream", &ElasticBuffer::get_comm_stream)
         .def("get_physical_domain_size", &ElasticBuffer::get_physical_domain_size)
