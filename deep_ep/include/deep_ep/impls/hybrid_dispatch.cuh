@@ -5,6 +5,7 @@
 #include <deep_ep/common/exception.cuh>
 #include <deep_ep/common/layout.cuh>
 #include <deep_ep/common/math.cuh>
+#include <deep_ep/common/nvfp4.cuh>
 #include <deep_ep/common/ptx.cuh>
 
 
@@ -12,12 +13,13 @@ namespace deep_ep::elastic {
 
 template <bool kDoCPUSync,
           bool kReuseSlotIndices,
+          bool kUseNVFP4,
           int kNumSMs,
           int kNumNotifyWarps, int kNumScaleoutWarps, int kNumForwardWarps,
           int kNumScaleoutRanks, int kNumScaleupRanks,
-          int kNumHiddenBytes, int kNumSFPacks,
+          int kHidden, int kNumHiddenBytes, int kNumSFPacks,
           int kNumMaxTokensPerRank,
-          int kNumExperts, int kNumTopk, int kExpertAlignment,
+          int kNumExperts, int kNumTopk, int kExpertAlignment, int kExpertCapacity,
           int kNumQPs, int64_t kNumTimeoutCycles,
           int kNumScaleupRanksPerLane = math::constexpr_ceil_div(kNumScaleupRanks, 32),
           int kNumChannelsPerSM = kNumScaleoutWarps,
@@ -32,7 +34,8 @@ template <bool kDoCPUSync,
           int kNumThreads = kNumNotifyThreads + kNumScaleoutSendThreads + kNumForwardThreads>
 __global__ void __launch_bounds__(kNumThreads, 1)
 hybrid_dispatch_impl(
-    void* x, sf_pack_t* sf, topk_idx_t* topk_idx, float* topk_weights,
+    void* x, sf_pack_t* sf, float* x_global_scale,
+    topk_idx_t* topk_idx, float* topk_weights,
     topk_idx_t* copied_topk_idx,
     int* cumulative_local_expert_recv_stats,
     int* psum_num_recv_tokens_per_scaleup_rank,
@@ -52,6 +55,7 @@ hybrid_dispatch_impl(
     EP_STATIC_ASSERT(kNumExperts % kNumScaleupRanks == 0, "Invalid number of experts or ranks");
     EP_STATIC_ASSERT(kNumNotifyWarps % 4 == 0, "Invalid warpgroup size");
     EP_STATIC_ASSERT(kNumScaleoutWarps == kNumForwardWarps, "Invalid warp size");
+    EP_STATIC_ASSERT(not kUseNVFP4 or kExpertCapacity > 0, "Invalid NVFP4 expert capacity");
 
     // Utils
     // NOTES: a warp is a channel (different channels may share QPs)
@@ -258,45 +262,50 @@ hybrid_dispatch_impl(
 
             // Wait local counters to be ready
             // NOTES: here we only care the prefix sum by scale-up peers (used for later epilogue), not all ranks
-            EP_STATIC_ASSERT(kNumNotifyWarps == 0 or kNumScaleupRanks + kNumExpertsPerRank <= kNumNotifyWarps * 32,
-                             "Insufficient notify threads");
-            comm::timeout_while<kNumTimeoutCycles>(thread_idx < kNumScaleupRanks + kNumExpertsPerRank,
-                [&](const bool& is_last_check) {
-                const auto status = ptx::ld_volatile<int64_t>(workspace_layout.get_scaleup_rank_expert_count_ptr<false>() + thread_idx);
-                if ((status >> 32ull) == kNumScaleupRanks) {
-                    // Clean GPU workspace and write into host workspace
-                    const auto count = static_cast<int>(status & 0xffffffffll);
-                    const auto aligned_count = math::align<int>(
-                        count, thread_idx < kNumScaleupRanks ? 1 : kExpertAlignment);
+            // Reuse notify threads when the local counters exceed one round.
+            #pragma unroll
+            for (int offset = 0; offset < kNumScaleupRanks + kNumExpertsPerRank; offset += kNumNotifyThreads) {
+                const int counter_idx = offset + thread_idx;
+                comm::timeout_while<kNumTimeoutCycles>(counter_idx < kNumScaleupRanks + kNumExpertsPerRank,
+                    [&](const bool& is_last_check) {
+                    const auto status = ptx::ld_volatile<int64_t>(workspace_layout.get_scaleup_rank_expert_count_ptr<false>() + counter_idx);
+                    if ((status >> 32ull) == kNumScaleupRanks) {
+                        // Clean GPU workspace and write into host workspace
+                        const auto count = static_cast<int>(status & 0xffffffffll);
+                        const auto aligned_count = math::align<int>(
+                            count, (counter_idx < kNumScaleupRanks or kUseNVFP4) ? 1 : kExpertAlignment);
 
-                    workspace_layout.get_scaleup_rank_expert_count_ptr<false>()[thread_idx] = 0;
-                    if constexpr (kDoCPUSync) {
-                        host_workspace_layout.get_scaleup_rank_expert_count_ptr<false>()[thread_idx] =
-                            math::encode_decode_positive(aligned_count);
+                        workspace_layout.get_scaleup_rank_expert_count_ptr<false>()[counter_idx] = 0;
+                        if constexpr (kDoCPUSync) {
+                            host_workspace_layout.get_scaleup_rank_expert_count_ptr<false>()[counter_idx] =
+                                math::encode_decode_positive(aligned_count);
+                        }
+
+                        // Update statistics counters
+                        if (cumulative_local_expert_recv_stats != nullptr and counter_idx >= kNumScaleupRanks)
+                            atomicAdd(cumulative_local_expert_recv_stats + (counter_idx - kNumScaleupRanks), count);
+                        if (counter_idx >= kNumScaleupRanks) {
+                            if (num_unaligned_recv_tokens_per_expert != nullptr)
+                                num_unaligned_recv_tokens_per_expert[counter_idx - kNumScaleupRanks] = count;
+                            if constexpr (kUseNVFP4)
+                                EP_DEVICE_ASSERT(count <= kExpertCapacity);
+                        }
+
+                        // Save for later prefix sum calculation
+                        rank_expert_count[counter_idx] = aligned_count;
+                        return true;
                     }
 
-                    // Update statistics counters
-                    if (cumulative_local_expert_recv_stats != nullptr and thread_idx >= kNumScaleupRanks)
-                        atomicAdd(cumulative_local_expert_recv_stats + (thread_idx - kNumScaleupRanks), count);
-
-                    // Write unaligned count before aligning
-                    if (num_unaligned_recv_tokens_per_expert != nullptr and thread_idx >= kNumScaleupRanks)
-                        num_unaligned_recv_tokens_per_expert[thread_idx - kNumScaleupRanks] = count;
-
-                    // Save for later prefix sum calculation
-                    rank_expert_count[thread_idx] = aligned_count;
-                    return true;
-                }
-
-                if (is_last_check) {
-                    printf("DeepEP hybrid notify (scale-up reduction) timeout,"
-                           "scale-out: %d/%d, scale-up: %d/%d, "
-                           "thread: %d, status: %d | %d, expected: %d\n",
-                           scaleout_rank_idx, kNumScaleoutRanks, scaleup_rank_idx, kNumScaleupRanks, thread_idx,
-                           static_cast<int>(status >> 32), static_cast<int>(status & 0xffffffff), kNumScaleupRanks);
-                }
-                return false;
-            });
+                    if (is_last_check) {
+                        printf("DeepEP hybrid notify (scale-up reduction) timeout,"
+                               "scale-out: %d/%d, scale-up: %d/%d, "
+                               "thread: %d, status: %d | %d, expected: %d\n",
+                               scaleout_rank_idx, kNumScaleoutRanks, scaleup_rank_idx, kNumScaleupRanks, counter_idx,
+                               static_cast<int>(status >> 32), static_cast<int>(status & 0xffffffff), kNumScaleupRanks);
+                    }
+                    return false;
+                });
+            }
             ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
 
             // Do prefix sum by the warps of the first SM
@@ -323,7 +332,13 @@ hybrid_dispatch_impl(
                 do_psum(rank_count, psum_num_recv_tokens_per_scaleup_rank, kNumScaleupRanks, 0);
             } else if (warp_idx == 1) {
                 // Exclusive prefix sum for later expanding
-                do_psum(expert_count, psum_num_recv_tokens_per_expert, kNumExpertsPerRank, 1);
+                if constexpr (kUseNVFP4) {
+                    #pragma unroll
+                    for (int i = lane_idx; i < kNumExpertsPerRank + 1; i += 32)
+                        psum_num_recv_tokens_per_expert[i] = i * kExpertCapacity;
+                } else {
+                    do_psum(expert_count, psum_num_recv_tokens_per_expert, kNumExpertsPerRank, 1);
+                }
             }
         }
     } else if (warp_idx < kNumNotifyWarps + kNumScaleoutWarps) {
@@ -355,38 +370,46 @@ hybrid_dispatch_impl(
             if (token_idx >= num_tokens)
                 return;
 
-            // Issue TMA load
-            const auto token_i64_idx = static_cast<int64_t>(token_idx);
-            if (ptx::elect_one_sync()) {
-                ptx::tma_load_1d(tma_buffer.get_hidden_ptr(), math::advance_ptr(x, token_i64_idx * kNumHiddenBytes),
-                                 mbarrier_ptr, kNumHiddenBytes);
-            }
-            __syncwarp();
-
-            // Issue SF `cp.async`
-            if constexpr (kNumSFPacks > 0) {
-                EP_STATIC_ASSERT(sizeof(sf_pack_t) % 4 == 0, "Unaligned SF element type");
-                const auto gmem_src_ptr = math::advance_ptr<sf_pack_t>(sf, token_i64_idx * sf_token_stride * sizeof(sf_pack_t));
-                const auto smem_dst_ptr = tma_buffer.get_sf_ptr();
-
-                constexpr auto kNumFullIters = kNumSFPacks / 32;
-                #pragma unroll
-                for (int k = 0; k < kNumFullIters; ++ k) {
-                    ptx::cp_async_ca(gmem_src_ptr + (k * 32 + lane_idx) * sf_hidden_stride,
-                                     smem_dst_ptr + k * 32 + lane_idx);
+            if constexpr (not kUseNVFP4) {
+                // Issue TMA load
+                const auto token_i64_idx = static_cast<int64_t>(token_idx);
+                if (ptx::elect_one_sync()) {
+                    ptx::tma_load_1d(tma_buffer.get_hidden_ptr(), math::advance_ptr(x, token_i64_idx * kNumHiddenBytes),
+                                     mbarrier_ptr, kNumHiddenBytes);
                 }
-                if (kNumFullIters * 32 + lane_idx < kNumSFPacks) {
-                    ptx::cp_async_ca(gmem_src_ptr + (kNumFullIters * 32 + lane_idx) * sf_hidden_stride,
-                                     smem_dst_ptr + kNumFullIters * 32 + lane_idx);
-                }
-                ptx::cp_async_mbarrier_arrive(mbarrier_ptr);
                 __syncwarp();
+
+                // Issue SF `cp.async`
+                if constexpr (kNumSFPacks > 0) {
+                    EP_STATIC_ASSERT(sizeof(sf_pack_t) % 4 == 0, "Unaligned SF element type");
+                    const auto gmem_src_ptr = math::advance_ptr<sf_pack_t>(sf, token_i64_idx * sf_token_stride * sizeof(sf_pack_t));
+                    const auto smem_dst_ptr = tma_buffer.get_sf_ptr();
+
+                    constexpr auto kNumFullIters = kNumSFPacks / 32;
+                    #pragma unroll
+                    for (int k = 0; k < kNumFullIters; ++ k) {
+                        ptx::cp_async_ca(gmem_src_ptr + (k * 32 + lane_idx) * sf_hidden_stride,
+                                         smem_dst_ptr + k * 32 + lane_idx);
+                    }
+                    if (kNumFullIters * 32 + lane_idx < kNumSFPacks) {
+                        ptx::cp_async_ca(gmem_src_ptr + (kNumFullIters * 32 + lane_idx) * sf_hidden_stride,
+                                         smem_dst_ptr + kNumFullIters * 32 + lane_idx);
+                    }
+                    ptx::cp_async_mbarrier_arrive(mbarrier_ptr);
+                    __syncwarp();
+                }
             }
         };
 
         // Iterate all tokens
         preload_next_token(channel_idx);
         for (int token_idx = channel_idx; token_idx < num_tokens; token_idx += kNumChannels) {
+            if constexpr (kUseNVFP4) {
+                nvfp4::quantize_token<kHidden>(
+                    x, tma_buffer.get_hidden_ptr(), tma_buffer.get_sf_ptr(),
+                    *x_global_scale, token_idx, lane_idx);
+            }
+
             // Load top-k indices and weights
             EP_STATIC_ASSERT(kNumTopk <= 32, "Insufficient lanes for loading top-k indices");
             int stored_dst_scaleout_rank_idx = -1;
@@ -421,8 +444,10 @@ hybrid_dispatch_impl(
 
             // Wait TMA arrival and issue the TMA store into send buffer
             if (ptx::elect_one_sync()) {
-                ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, kNumHiddenBytes);
-                ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
+                if constexpr (not kUseNVFP4) {
+                    ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, kNumHiddenBytes);
+                    ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
+                }
 
                 // So if no ranks will go by RDMA, we skip the send buffer stores
                 if (scaleout_rank_mask ^ (1 << scaleout_rank_idx)) {

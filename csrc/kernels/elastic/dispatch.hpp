@@ -18,18 +18,20 @@ public:
         bool is_scaleup_nvlink;
         bool do_cpu_sync;
         bool reuse_slot_indices;
+        bool use_nvfp4;
         int num_notify_warps;
         int num_dispatch_warps; // For hybrid dispatch
         int num_scaleout_warps, num_forward_warps; // For direct dispatch
         int num_scaleout_ranks, num_scaleup_ranks;
-        int num_hidden_bytes, num_sf_packs;
+        int hidden, num_hidden_bytes, num_sf_packs;
         int num_max_tokens_per_rank;
-        int num_experts, num_topk, expert_alignment;
+        int num_experts, num_topk, expert_alignment, expert_capacity;
         int num_qps;
         int64_t num_timeout_cycles;
 
         // Parameters
-        void* x; sf_pack_t* sf; topk_idx_t* topk_idx; float* topk_weights;
+        void* x; sf_pack_t* sf; float* x_global_scale;
+        topk_idx_t* topk_idx; float* topk_weights;
         topk_idx_t* copied_topk_idx;
         int* cumulative_local_expert_recv_stats;
         int* psum_num_recv_tokens_per_scaleup_rank;
@@ -52,28 +54,30 @@ public:
         std::string header_name, func_name;
         if (args.num_scaleout_ranks == 1) {
             header_name = "dispatch";
-            func_name = fmt::format("dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+            func_name = fmt::format("dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
                 args.is_scaleup_nvlink,
                 args.do_cpu_sync,
                 args.reuse_slot_indices,
+                args.use_nvfp4,
                 args.launch_args.grid_dim.first,
                 args.num_notify_warps, args.num_dispatch_warps,
                 args.num_scaleup_ranks,
-                args.num_hidden_bytes, args.num_sf_packs,
+                args.hidden, args.num_hidden_bytes, args.num_sf_packs,
                 args.num_max_tokens_per_rank,
-                args.num_experts, args.num_topk, args.expert_alignment,
+                args.num_experts, args.num_topk, args.expert_alignment, args.expert_capacity,
                 args.num_qps, args.num_timeout_cycles);
         } else {
             header_name = "hybrid_dispatch";
-            func_name = fmt::format("hybrid_dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+            func_name = fmt::format("hybrid_dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
                 args.do_cpu_sync,
                 args.reuse_slot_indices,
+                args.use_nvfp4,
                 args.launch_args.grid_dim.first,
                 args.num_notify_warps, args.num_scaleout_warps, args.num_forward_warps,
                 args.num_scaleout_ranks, args.num_scaleup_ranks,
-                args.num_hidden_bytes, args.num_sf_packs,
+                args.hidden, args.num_hidden_bytes, args.num_sf_packs,
                 args.num_max_tokens_per_rank,
-                args.num_experts, args.num_topk, args.expert_alignment,
+                args.num_experts, args.num_topk, args.expert_alignment, args.expert_capacity,
                 args.num_qps, args.num_timeout_cycles);
         }
 
@@ -92,7 +96,7 @@ static void __instantiate_kernel() {{
         if (args.num_scaleout_ranks == 1) {
             EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(
                 kernel, config,
-                args.x, args.sf, args.topk_idx, args.topk_weights,
+                args.x, args.sf, args.x_global_scale, args.topk_idx, args.topk_weights,
                 args.copied_topk_idx,
                 args.cumulative_local_expert_recv_stats,
                 args.psum_num_recv_tokens_per_scaleup_rank,
@@ -108,7 +112,7 @@ static void __instantiate_kernel() {{
         } else {
             EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(
                 kernel, config,
-                args.x, args.sf, args.topk_idx, args.topk_weights,
+                args.x, args.sf, args.x_global_scale, args.topk_idx, args.topk_weights,
                 args.copied_topk_idx,
                 args.cumulative_local_expert_recv_stats,
                 args.psum_num_recv_tokens_per_scaleup_rank,
@@ -134,11 +138,11 @@ static int get_num_notify_smem_bytes(const int& num_ranks, const int& num_expert
 }
 
 static layout::TokenLayout get_dispatch_token_layout(
-    const int& hidden, const int& elem_size, const int& num_sf_packs, const int& num_topk) {
-    return layout::TokenLayout(hidden * elem_size, num_sf_packs * sizeof(sf_pack_t), num_topk, true);
+    const int& num_hidden_bytes, const int& num_sf_packs, const int& num_topk) {
+    return layout::TokenLayout(num_hidden_bytes, num_sf_packs * sizeof(sf_pack_t), num_topk, true);
 }
 
-static void launch_dispatch(void* x, void* sf,
+static void launch_dispatch(void* x, void* sf, float* x_global_scale,
                             topk_idx_t* topk_idx, float* topk_weights,
                             topk_idx_t* copied_topk_idx,
                             int* cumulative_local_expert_recv_stats,
@@ -151,6 +155,7 @@ static void launch_dispatch(void* x, void* sf,
                             const int& hidden, const int& elem_size,
                             const int& num_sf_packs, const int& sf_token_stride, const int& sf_hidden_stride,
                             const int& num_experts, const int& num_topk, const int& expert_alignment,
+                            const int& expert_capacity, const bool& use_nvfp4,
                             const jit::NoRefPtr& nccl_dev_comm, const ncclWindow_t& nccl_window,
                             void* buffer,
                             void* workspace, void* mapped_host_workspace,
@@ -184,7 +189,8 @@ static void launch_dispatch(void* x, void* sf,
 
     // Maximize shared memory utilization
     if (num_scaleout_ranks == 1) {
-        const auto token_layout = get_dispatch_token_layout(hidden, elem_size, num_sf_packs, num_topk);
+        const auto num_hidden_bytes = use_nvfp4 ? hidden / 2 : hidden * elem_size;
+        const auto token_layout = get_dispatch_token_layout(num_hidden_bytes, num_sf_packs, num_topk);
         num_dispatch_warps = std::min<int>(
             (num_smem_bytes - num_notify_smem_bytes) / token_layout.get_num_bytes<true>(), 32 - num_notify_warps);
         num_threads = (num_notify_warps + num_dispatch_warps) * 32;
@@ -200,15 +206,20 @@ static void launch_dispatch(void* x, void* sf,
         .is_scaleup_nvlink = is_scaleup_nvlink,
         .do_cpu_sync = do_cpu_sync,
         .reuse_slot_indices = reuse_slot_indices,
+        .use_nvfp4 = use_nvfp4,
         .num_notify_warps = num_notify_warps,
         .num_dispatch_warps = num_dispatch_warps,
         .num_scaleout_warps = num_scaleout_warps, .num_forward_warps = num_forward_warps,
         .num_scaleout_ranks = num_scaleout_ranks, .num_scaleup_ranks = num_scaleup_ranks,
-        .num_hidden_bytes = hidden * elem_size, .num_sf_packs = num_sf_packs,
+        .hidden = hidden,
+        .num_hidden_bytes = use_nvfp4 ? hidden / 2 : hidden * elem_size,
+        .num_sf_packs = num_sf_packs,
         .num_max_tokens_per_rank = num_max_tokens_per_rank,
         .num_experts = num_experts, .num_topk = num_topk, .expert_alignment = expert_alignment,
+        .expert_capacity = expert_capacity,
         .num_qps = num_qps, .num_timeout_cycles = num_timeout_cycles,
-        .x = x, .sf = static_cast<sf_pack_t*>(sf), .topk_idx = topk_idx, .topk_weights = topk_weights,
+        .x = x, .sf = static_cast<sf_pack_t*>(sf), .x_global_scale = x_global_scale,
+        .topk_idx = topk_idx, .topk_weights = topk_weights,
         .copied_topk_idx = copied_topk_idx,
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats,
         .psum_num_recv_tokens_per_scaleup_rank = psum_num_recv_tokens_per_scaleup_rank,
@@ -233,13 +244,13 @@ class DispatchCopyEpilogueRuntime final : public jit::LaunchRuntime<DispatchCopy
 public:
     struct Args {
         // Templated arguments
-        bool do_expand, cached_mode, do_zero_padding;
+        bool do_expand, cached_mode, do_zero_padding, use_nvfp4, is_afd;
         int num_channels;
         int num_warps;
         int num_scaleout_ranks, num_scaleup_ranks;
         int num_hidden_bytes, num_sf_packs;
         int num_max_tokens_per_rank;
-        int num_experts, num_topk, expert_alignment;
+        int num_experts, num_topk, expert_alignment, expert_capacity;
 
         // Parameters
         void *buffer, *workspace;
@@ -264,15 +275,15 @@ public:
 using namespace deep_ep::elastic;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&dispatch_copy_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&dispatch_copy_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
 }}
 )",
-                           args.do_expand, args.cached_mode, args.do_zero_padding,
+                           args.do_expand, args.cached_mode, args.do_zero_padding, args.use_nvfp4, args.is_afd,
                            args.launch_args.grid_dim.first, args.num_channels, args.num_warps,
                            args.num_scaleout_ranks, args.num_scaleup_ranks,
                            args.num_hidden_bytes, args.num_sf_packs,
                            args.num_max_tokens_per_rank,
-                           args.num_experts, args.num_topk, args.expert_alignment);
+                           args.num_experts, args.num_topk, args.expert_alignment, args.expert_capacity);
     }
 
     static void launch_impl(const jit::KernelHandle& kernel, const jit::LaunchConfigHandle& config, Args args) {
@@ -290,6 +301,7 @@ static void __instantiate_kernel() {{
     }
 };
 
+template <bool kAFD>
 static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
                                           int* psum_num_recv_tokens_per_scaleup_rank,
                                           int* psum_num_recv_tokens_per_expert,
@@ -302,6 +314,7 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
                                           const int& num_hidden_bytes,
                                           const int& num_sf_packs, const int& recv_sf_token_stride, const int& recv_sf_hidden_stride,
                                           const int& num_experts, const int& num_topk, const int& expert_alignment,
+                                          const int& expert_capacity, const bool& use_nvfp4,
                                           const int& scaleout_rank_idx, const int& scaleup_rank_idx,
                                           const int& num_scaleout_ranks, const int& num_scaleup_ranks,
                                           const int& num_sms, const int& num_smem_bytes,
@@ -316,12 +329,13 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
 
     // Generate, build and launch
     const DispatchCopyEpilogueRuntime::Args args = {
-        .do_expand = do_expand, .cached_mode = cached_mode, .do_zero_padding = do_zero_padding,
+        .do_expand = do_expand, .cached_mode = cached_mode, .do_zero_padding = do_zero_padding, .use_nvfp4 = use_nvfp4,
+        .is_afd = kAFD,
         .num_channels = num_channels, .num_warps = num_warps,
         .num_scaleout_ranks = num_scaleout_ranks, .num_scaleup_ranks = num_scaleup_ranks,
         .num_hidden_bytes = num_hidden_bytes, .num_sf_packs = num_sf_packs,
         .num_max_tokens_per_rank = num_max_tokens_per_rank,
-        .num_experts = num_experts, .num_topk = num_topk, .expert_alignment = expert_alignment,
+        .num_experts = num_experts, .num_topk = num_topk, .expert_alignment = expert_alignment, .expert_capacity = expert_capacity,
         .buffer = buffer, .workspace = workspace,
         .psum_num_recv_tokens_per_scaleup_rank = psum_num_recv_tokens_per_scaleup_rank,
         .psum_num_recv_tokens_per_expert = psum_num_recv_tokens_per_expert,
