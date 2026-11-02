@@ -13,7 +13,7 @@
 namespace deep_ep::elastic {
 
 template <bool kIsScaleupNVLink,
-          bool kUseExpandedLayout, bool kAllowMultipleReduction,
+          bool kUseExpandedLayout, bool kAllowMultipleReduction, bool kApplyWeights,
           int kNumSMs, int kNumWarps,
           int kNumRanks,
           int kHidden,
@@ -28,6 +28,7 @@ template <bool kIsScaleupNVLink,
 __global__ void __launch_bounds__(kNumThreads, 1)
 combine_impl(nv_bfloat16* x,
              float* topk_weights,
+             const float routed_scaling_factor,
              int* src_metadata, int* psum_num_recv_tokens_per_scaleup_rank,
              const ncclDevComm_t nccl_dev_comm, const ncclWindow_t nccl_window,
              void* buffer, void* workspace,
@@ -65,7 +66,7 @@ combine_impl(nv_bfloat16* x,
     __syncwarp();
 
     // Expanding send mode must not be backward
-    if constexpr (kDoExpandedSend)
+    if constexpr (kDoExpandedSend and not kApplyWeights)
         EP_DEVICE_ASSERT(topk_weights == nullptr);
 
     // Gin handle
@@ -130,13 +131,28 @@ combine_impl(nv_bfloat16* x,
                 token_idx_in_tensor = ptx::exchange(stored_topk_slot_idx, ptx::get_master_lane_idx(reduce_valid_mask));
 
             // No reduce
+            if constexpr (kApplyWeights) {
+                if (ptx::elect_one_sync()) {
+                    const auto load_ptr =
+                        math::advance_ptr(x, static_cast<int64_t>(token_idx_in_tensor) * kNumHiddenBytes);
+                    ptx::tma_store_wait();
+                    ptx::tma_load_1d(tma_buffer.get_base_ptr(), load_ptr, mbarrier_ptr, kNumHiddenBytes);
+                    ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, kNumHiddenBytes);
+                    ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
+                }
+                scale_combine_buffer<kHiddenVec>(
+                    lane_idx, static_cast<combine_vec_t*>(tma_buffer.get_base_ptr()),
+                    __ldg(topk_weights + token_idx_in_tensor), routed_scaling_factor);
+            }
             if (ptx::elect_one_sync()) {
-                const auto load_ptr =
-                    math::advance_ptr(x, static_cast<int64_t>(token_idx_in_tensor) * kNumHiddenBytes);
-                ptx::tma_store_wait();
-                ptx::tma_load_1d(tma_buffer.get_base_ptr(), load_ptr, mbarrier_ptr, kNumHiddenBytes);
-                ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, kNumHiddenBytes);
-                ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
+                if constexpr (not kApplyWeights) {
+                    const auto load_ptr =
+                        math::advance_ptr(x, static_cast<int64_t>(token_idx_in_tensor) * kNumHiddenBytes);
+                    ptx::tma_store_wait();
+                    ptx::tma_load_1d(tma_buffer.get_base_ptr(), load_ptr, mbarrier_ptr, kNumHiddenBytes);
+                    ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, kNumHiddenBytes);
+                    ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
+                }
                 ptx::tma_store_1d(master_token_buffer.get_base_ptr(), tma_buffer.get_base_ptr(), kNumHiddenBytes);
                 ptx::tma_store_commit();
             }
@@ -154,7 +170,7 @@ combine_impl(nv_bfloat16* x,
 
             // Reduce into shared memory
             constexpr int kUnrollFactor = get_max_unroll_factor<kHiddenVec, 4>();
-            combine_reduce<kHiddenVec, kUnrollFactor, math::constexpr_ceil_div(kNumTopk, kNumRanks)>(
+            combine_reduce<kHiddenVec, kUnrollFactor, math::constexpr_ceil_div(kNumTopk, kNumRanks), kApplyWeights>(
                 lane_idx, topk_slot_idx, static_cast<combine_vec_t*>(tma_buffer.get_base_ptr()),
                 /* Get source base */ [=](const int& slot_idx) {
                     return math::advance_ptr<combine_vec_t>(
@@ -163,7 +179,9 @@ combine_impl(nv_bfloat16* x,
                 /* Wait buffer release */ [=]() {
                     ptx::tma_store_wait();
                     __syncwarp();
-                }
+                },
+                static_cast<combine_vec_t*>(nullptr), static_cast<combine_vec_t*>(nullptr),
+                topk_weights, routed_scaling_factor
             );
             ptx::tma_store_fence();
             __syncwarp();
@@ -182,13 +200,25 @@ combine_impl(nv_bfloat16* x,
                 if (slot_idx >= 0) {
                     const auto src_token_ptr = math::advance_ptr<int4>(x, slot_idx * static_cast<int64_t>(kNumHiddenBytes));
                     const auto token_buffer = recv_buffer.get_rank_buffer(k).get_token_buffer(src_token_idx);
+                    if constexpr (kApplyWeights) {
+                        if (ptx::elect_one_sync()) {
+                            ptx::tma_store_wait();
+                            ptx::tma_load_1d(tma_buffer.get_base_ptr(), src_token_ptr, mbarrier_ptr, kNumHiddenBytes);
+                            ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, kNumHiddenBytes);
+                            ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
+                        }
+                        scale_combine_buffer<kHiddenVec>(
+                            lane_idx, static_cast<combine_vec_t*>(tma_buffer.get_base_ptr()),
+                            __ldg(topk_weights + slot_idx), routed_scaling_factor);
+                    }
                     if (ptx::elect_one_sync()) {
-                        // Load
-                        ptx::tma_store_wait();
-                        ptx::tma_load_1d(tma_buffer.get_base_ptr(), src_token_ptr, mbarrier_ptr, kNumHiddenBytes);
-                        ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, kNumHiddenBytes);
-                        ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
-
+                        if constexpr (not kApplyWeights) {
+                            // Load
+                            ptx::tma_store_wait();
+                            ptx::tma_load_1d(tma_buffer.get_base_ptr(), src_token_ptr, mbarrier_ptr, kNumHiddenBytes);
+                            ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, kNumHiddenBytes);
+                            ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
+                        }
                         if (nvlink_bypass) {
                             // Write into the same position
                             ptx::tma_store_1d(gin.get_sym_ptr<team_t>(token_buffer.get_base_ptr(), src_rank_idx),
@@ -213,7 +243,7 @@ combine_impl(nv_bfloat16* x,
         }
 
         // Write topk weights
-        if (not kDoExpandedSend and topk_weights != nullptr and lane_idx < kNumTopk) {
+        if (not kApplyWeights and not kDoExpandedSend and topk_weights != nullptr and lane_idx < kNumTopk) {
             float value = 0;
             if constexpr (kUseExpandedLayout) {
                 if (stored_topk_slot_idx >= 0)

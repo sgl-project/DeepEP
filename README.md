@@ -58,6 +58,29 @@ We omit results for larger EP configurations for the time being, but encourage i
 
 For V1 performance data, see [docs/legacy.md](docs/legacy.md#performance).
 
+## SGLang AFD
+
+SGLang's Attention-FFN Disaggregation (AFD) backend uses `deep_ep.afd` to separate attention ranks from routed-expert ranks. The extension supports ranks without experts, NVFP4 dispatch, fixed-capacity expert layouts, and router weighting during combine. It is included in the `sgl-deep-ep` package alongside the standard `Buffer` and `ElasticBuffer` APIs.
+
+Build and install the package using the [SGLang wheel instructions](sgl_deep_ep/README.md#building-from-a-checkout). Dispatch and combine kernels are compiled at runtime, so keep `nvcc`, `cuobjdump`, and NCCL device headers available after installation. For nonstandard locations, set `CUDA_HOME` and `EP_NCCL_ROOT_DIR`.
+
+SGLang manages the communicator, buffer allocation, dispatch, and combine. `deep_ep.afd` exposes native bindings with `dispatch_afd` and `combine_afd`; it does not use the `deep_ep.ElasticBuffer` Python wrapper shown in the examples below. The standard `dispatch` and `combine` methods retain their behavior, including expanded-layout weight transport for backward operations. Top-k indices use `torch.int64`; keep `EP_NUM_TOPK_IDX_BITS=64`, the package default.
+
+From outside the source checkout, verify that the installed package exposes the AFD bindings:
+
+```bash
+python -c "from deep_ep import afd; print(afd.__version__, afd.ElasticBuffer)"
+```
+
+This checks native extension loading and JIT dependencies. To test two-lane routing with eager execution and CUDA Graph replay on two GPUs:
+
+```bash
+python tests/elastic/test_ep.py --num-processes 2 --test-afd \
+  --num-tokens 8 --hidden 256 --num-experts 8 --num-topk 2
+```
+
+This test also constructs a standard buffer for setup. On a single NVLink domain without NCCL GIN, run it with `EP_DISABLE_GIN=1`. The AFD constructor supports this topology without the environment override.
+
 ## Quick start
 
 ### Requirements
