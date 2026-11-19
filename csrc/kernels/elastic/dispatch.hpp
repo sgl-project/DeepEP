@@ -1,5 +1,16 @@
 #pragma once
 
+// MIT License
+//
+// Copyright (c) 2025 DeepSeek
+// Changes and additions copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
 #include <nccl.h>
 #include <nccl_device.h>
 
@@ -8,6 +19,7 @@
 
 #include "../../jit/compiler.hpp"
 #include "../../jit/launch_runtime.hpp"
+#include "dispatch_unordered.hpp"
 
 namespace deep_ep::elastic {
 
@@ -44,6 +56,7 @@ public:
         void* buffer;
         void* workspace; void* mapped_host_workspace;
         int scaleout_rank_idx, scaleup_rank_idx;
+        std::optional<UnorderedDispatchExtendedArgs> unordered;
 
         jit::LaunchArgs launch_args;
     };
@@ -63,7 +76,7 @@ public:
                 args.num_max_tokens_per_rank,
                 args.num_experts, args.num_topk, args.expert_alignment,
                 args.num_qps, args.num_timeout_cycles);
-        } else {
+        } else if (not args.unordered.has_value()) {
             header_name = "hybrid_dispatch";
             func_name = fmt::format("hybrid_dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
                 args.do_cpu_sync,
@@ -75,6 +88,22 @@ public:
                 args.num_max_tokens_per_rank,
                 args.num_experts, args.num_topk, args.expert_alignment,
                 args.num_qps, args.num_timeout_cycles);
+        } else {
+            header_name = "hybrid_dispatch_unordered";
+            func_name = fmt::format("hybrid_unordered_dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+                args.do_cpu_sync,
+                args.reuse_slot_indices,
+                args.unordered->allow_multiple_reduction,
+                args.unordered->do_expand,
+                args.unordered->double_buffer_forward,
+                args.launch_args.grid_dim.first,
+                args.num_notify_warps, args.num_scaleout_warps, args.num_forward_warps,
+                args.num_scaleout_ranks, args.num_scaleup_ranks,
+                args.num_hidden_bytes, args.num_sf_packs,
+                args.num_max_tokens_per_rank,
+                args.num_experts, args.num_topk, args.expert_alignment,
+                args.num_qps, args.num_timeout_cycles,
+                args.unordered->gin_indexed_signals_cnt);
         }
 
         return fmt::format(R"(
@@ -105,6 +134,24 @@ static void __instantiate_kernel() {{
                 args.buffer,
                 args.workspace, args.mapped_host_workspace,
                 args.scaleup_rank_idx));
+        } else if (not args.unordered.has_value()) {
+            EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(
+                kernel, config,
+                args.x, args.sf, args.topk_idx, args.topk_weights,
+                args.copied_topk_idx,
+                args.cumulative_local_expert_recv_stats,
+                args.psum_num_recv_tokens_per_scaleup_rank,
+                args.psum_num_recv_tokens_per_expert,
+                args.num_unaligned_recv_tokens_per_expert,
+                args.dst_buffer_slot_idx,
+                args.token_metadata_at_forward,
+                args.num_tokens,
+                args.sf_token_stride, args.sf_hidden_stride,
+                args.nccl_dev_comm, args.nccl_window,
+                args.buffer,
+                args.workspace, args.mapped_host_workspace,
+                args.scaleout_rank_idx, args.scaleup_rank_idx
+            ));
         } else {
             EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(
                 kernel, config,
@@ -116,6 +163,7 @@ static void __instantiate_kernel() {{
                 args.num_unaligned_recv_tokens_per_expert,
                 args.dst_buffer_slot_idx,
                 args.token_metadata_at_forward,
+                args.unordered->token_map_at_dispatch,
                 args.num_tokens,
                 args.sf_token_stride, args.sf_hidden_stride,
                 args.nccl_dev_comm, args.nccl_window,
@@ -162,7 +210,8 @@ static void launch_dispatch(void* x, void* sf,
                             const int& num_qps, const int64_t& num_timeout_cycles,
                             const bool& cached_mode,
                             const bool& do_cpu_sync,
-                            const at::cuda::CUDAStream& stream) {
+                            const at::cuda::CUDAStream& stream,
+                            const UnorderedDispatchExtendedArgs* unordered = nullptr) {
     // Cached mode does not support expert token counting
     if (cached_mode)
         EP_HOST_ASSERT(cumulative_local_expert_recv_stats == nullptr);
@@ -222,6 +271,7 @@ static void launch_dispatch(void* x, void* sf,
         .buffer = buffer,
         .workspace = workspace, .mapped_host_workspace = mapped_host_workspace,
         .scaleout_rank_idx = scaleout_rank_idx, .scaleup_rank_idx = scaleup_rank_idx,
+        .unordered = unordered ? std::make_optional(*unordered) : std::nullopt,
         // NOTES: make cluster dim 2 to overlap with clustered computation kernels
         .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 2 - (num_sms % 2), true)};
     const auto code = DispatchRuntime::generate(args);

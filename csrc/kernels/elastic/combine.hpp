@@ -1,12 +1,25 @@
 #pragma once
 
+// MIT License
+//
+// Copyright (c) 2025 DeepSeek
+// Changes and additions copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
 #include <nccl.h>
 
 #include <deep_ep/common/compiled.cuh>
 #include <deep_ep/common/exception.cuh>
+#include <deep_ep/impls/proxy_ring_unordered.cuh>
 
 #include "../../jit/compiler.hpp"
 #include "../../jit/launch_runtime.hpp"
+#include "combine_unordered.hpp"
 
 namespace deep_ep::elastic {
 
@@ -38,6 +51,7 @@ public:
         void* workspace;
         int scaleout_rank_idx, scaleup_rank_idx;
         int num_reduced_tokens;
+        std::optional<UnorderedCombineExtendedArgs> unordered;
 
         jit::LaunchArgs launch_args;
     };
@@ -58,8 +72,9 @@ public:
                                     args.num_topk,
                                     args.num_qps, args.num_timeout_cycles);
         } else {
-            header_name = "hybrid_combine";
-            func_name = fmt::format("hybrid_combine_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+            header_name = args.unordered.has_value() ? "hybrid_combine_unordered" : "hybrid_combine";
+            func_name = fmt::format("{}<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+                                    args.unordered.has_value() ? "hybrid_unordered_combine_impl" : "hybrid_combine_impl",
                                     args.use_expanded_layout, args.allow_multiple_reduction,
                                     args.launch_args.grid_dim.first,
                                     args.num_scaleup_warps, args.num_forward_warps,
@@ -91,7 +106,7 @@ static void __instantiate_kernel() {{
                                                      args.buffer, args.workspace,
                                                      args.scaleup_rank_idx,
                                                      args.num_reduced_tokens));
-        } else {
+        } else if (not args.unordered.has_value()) {
             EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(kernel, config,
                                                      args.x, args.topk_weights,
                                                      args.src_metadata,
@@ -102,6 +117,19 @@ static void __instantiate_kernel() {{
                                                      args.buffer, args.workspace,
                                                      args.scaleout_rank_idx, args.scaleup_rank_idx,
                                                      args.num_reduced_tokens));
+        } else {
+            EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(kernel, config,
+                                                     args.x, args.topk_weights,
+                                                     args.src_metadata,
+                                                     args.psum_num_recv_tokens_per_scaleup_rank,
+                                                     args.token_metadata_at_forward,
+                                                     args.channel_linked_list,
+                                                     args.unordered->token_map_at_dispatch,
+                                                     args.nccl_dev_comm, args.nccl_window,
+                                                     args.buffer, args.workspace,
+                                                     args.scaleout_rank_idx, args.scaleup_rank_idx,
+                                                     args.num_reduced_tokens,
+                                                     args.unordered->num_combined_tokens));
         }
     }
 };
@@ -129,7 +157,8 @@ static void* launch_combine(void* x,
                             const int& num_sms, const int& num_smem_bytes,
                             const int& num_channels,
                             const bool& use_expanded_layout, const bool& allow_multiple_reduction,
-                            const at::cuda::CUDAStream& stream) {
+                            const at::cuda::CUDAStream& stream,
+                            const UnorderedCombineExtendedArgs* unordered = nullptr) {
     // Maximize shared memory utilization
     const auto token_layout = get_combine_token_layout(hidden, sizeof(nv_bfloat16), num_topk);
     auto num_warps = std::min(num_smem_bytes / token_layout.get_num_bytes<true>(), 32);
@@ -142,9 +171,25 @@ static void* launch_combine(void* x,
         EP_HOST_ASSERT(num_channels / num_sms <= 16);
 
         num_scaleup_warps = num_forward_warps = num_channels / num_sms;
-        num_warps = num_scaleup_warps + num_forward_warps;
-        EP_HOST_ASSERT(num_warps * token_layout.get_num_bytes<true>() <= num_smem_bytes and
-                       "Invalid combine SM count, please try to match your dispatch config");
+
+        if (unordered == nullptr) {
+            num_warps = num_scaleup_warps + num_forward_warps;
+            EP_HOST_ASSERT(num_warps * token_layout.get_num_bytes<true>() <= num_smem_bytes and
+                           "Invalid combine SM count, please try to match your dispatch config");
+        } else {
+            const auto num_data_warps = num_scaleup_warps + num_forward_warps;
+            num_warps = num_data_warps + 1;
+            EP_HOST_ASSERT(num_warps * 32 <= 1024 and
+                           "combine warp count (scale-up + forward + proxy) exceeds the "
+                           "1024-thread block limit; use at least num_channels / 15 SMs");
+
+            // TMA buffers and the proxy rings share the dynamic shared memory
+            const int64_t tma_smem_bytes = static_cast<int64_t>(num_data_warps) * token_layout.get_num_bytes<true>();
+            const int64_t proxy_ring_bytes = deep_ep::elastic::ProxyRingLayout::get_num_bytes(
+                num_forward_warps, deep_ep::elastic::kProxyRingDepthDefault);
+            EP_HOST_ASSERT(tma_smem_bytes + proxy_ring_bytes <= num_smem_bytes and
+                           "Combine TMA buffers + proxy rings exceed per-block shared memory");
+        }
     }
 
     // Generate, build and launch
@@ -170,6 +215,7 @@ static void* launch_combine(void* x,
         .buffer = buffer, .workspace = workspace,
         .scaleout_rank_idx = scaleout_rank_idx, .scaleup_rank_idx = scaleup_rank_idx,
         .num_reduced_tokens = num_reduced_tokens,
+        .unordered = unordered ? std::make_optional(*unordered) : std::nullopt,
         // NOTES: make cluster dim 2 to overlap with clustered computation kernels
         .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 2 - (num_sms % 2), true)
     };
@@ -211,37 +257,52 @@ public:
         void* bias_1;
         int num_combined_tokens;
         int scaleout_rank_idx, scaleup_rank_idx;
+        std::optional<UnorderedCombineExtendedArgs> unordered;
 
         jit::LaunchArgs launch_args;
     };
 
     static std::string generate_impl(const Args& args) {
         return fmt::format(R"(
-#include <deep_ep/impls/combine_reduce_epilogue.cuh>
+#include <deep_ep/impls/{}>
 
 using namespace deep_ep::elastic;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&combine_reduce_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&combine_reduce_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}{}>);
 }}
-)",                        args.use_expanded_layout, args.allow_multiple_reduction,
+)",                        args.unordered.has_value() ? "combine_reduce_epilogue_unordered.cuh" : "combine_reduce_epilogue.cuh",
+                           args.use_expanded_layout, args.allow_multiple_reduction,
                            args.launch_args.grid_dim.first,
                            args.launch_args.num_threads / 32,
                            args.num_scaleout_ranks, args.num_scaleup_ranks,
                            args.hidden,
                            args.num_max_tokens_per_rank,
-                           args.num_experts, args.num_topk);
+                           args.num_experts, args.num_topk,
+                           args.unordered.has_value() ? fmt::format(", {}", args.unordered->num_channels) : "");
     }
 
     static void launch_impl(const jit::KernelHandle& kernel, const jit::LaunchConfigHandle& config, Args args) {
-        EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(kernel, config,
-                                                 args.combined_x,
-                                                 args.combined_topk_weights,
-                                                 args.combined_topk_idx,
-                                                 args.reduce_buffer,
-                                                 args.bias_0, args.bias_1,
-                                                 args.num_combined_tokens,
-                                                 args.scaleout_rank_idx, args.scaleup_rank_idx));
+        if (args.unordered.has_value()) {
+            EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(kernel, config,
+                                                     args.combined_x,
+                                                     args.combined_topk_weights,
+                                                     args.combined_topk_idx,
+                                                     args.reduce_buffer,
+                                                     args.bias_0, args.bias_1,
+                                                     args.unordered->token_map_at_dispatch,
+                                                     args.num_combined_tokens,
+                                                     args.scaleout_rank_idx, args.scaleup_rank_idx));
+        } else {
+            EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(kernel, config,
+                                                     args.combined_x,
+                                                     args.combined_topk_weights,
+                                                     args.combined_topk_idx,
+                                                     args.reduce_buffer,
+                                                     args.bias_0, args.bias_1,
+                                                     args.num_combined_tokens,
+                                                     args.scaleout_rank_idx, args.scaleup_rank_idx));
+        }
     }
 };
 
@@ -257,7 +318,8 @@ static void launch_combine_reduce_epilogue(void* combined_x,
                                            const int& scaleout_rank_idx, const int& scaleup_rank_idx,
                                            const int& num_sms, const int& num_smem_bytes,
                                            const bool& use_expanded_layout, const bool& allow_multiple_reduction,
-                                           const at::cuda::CUDAStream& stream) {
+                                           const at::cuda::CUDAStream& stream,
+                                           const UnorderedCombineExtendedArgs* unordered = nullptr) {
     // Maximize shared memory utilization
     // Too many warps may cause performance degrade, so we limit into 1024
     const auto token_layout = layout::TokenLayout(hidden * sizeof(nv_bfloat16), 0, 0, false);
@@ -279,6 +341,7 @@ static void launch_combine_reduce_epilogue(void* combined_x,
         .bias_0 = bias_0, .bias_1 = bias_1,
         .num_combined_tokens = num_combined_tokens,
         .scaleout_rank_idx = scaleout_rank_idx, .scaleup_rank_idx = scaleup_rank_idx,
+        .unordered = (unordered and num_scaleout_ranks > 1) ? std::make_optional(*unordered) : std::nullopt,
         .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 1, false, true)
     };
     const auto code = CombineReduceEpilogueRuntime::generate(args);

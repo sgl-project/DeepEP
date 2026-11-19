@@ -1,16 +1,31 @@
 #pragma once
 
+// MIT License
+//
+// Copyright (c) 2025 DeepSeek
+// Changes and additions copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
 #include <cuda_runtime.h>
 #include <memory>
 #include <numeric>
 #include <vector>
 #include <pybind11/functional.h>
 
+#include <deep_ep/common/gin_resource_alloc_unordered.cuh>
+#include <deep_ep/impls/proxy_ring_unordered.cuh>
 #include <deep_ep/common/layout.cuh>
+#include <deep_ep/common/layout_unordered.cuh>
 #include <deep_ep/common/compiled.cuh>
 
 #include "../kernels/backend/api.cuh"
 #include "../kernels/elastic/api.hpp"
+#include "../kernels/elastic/kernel_select.hpp"
 #include "../utils/event.hpp"
 #include "utils.hpp"
 
@@ -173,6 +188,10 @@ public:
         return {nccl_context->num_rdma_ranks, nccl_context->num_nvl_ranks};
     }
 
+    int get_num_allocated_qps() const {
+        return nccl_context->num_allocated_qps;
+    }
+
     std::tuple<int, int> get_logical_domain_size() const {
         return {nccl_context->num_scaleout_ranks, nccl_context->num_scaleup_ranks};
     }
@@ -196,6 +215,7 @@ public:
                        num_gpu_timeout_cycles,
                        nccl_context->is_scaleup_nvlink,
                        sequential,
+                       nccl_context->use_unordered_hybrid_kernel,
                        stream);
 
         // Let CPU wait
@@ -330,6 +350,9 @@ public:
 
         EP_HOST_ASSERT(num_max_tensor_bytes > 0 and num_max_inflight_tensors > 0);
         EP_HOST_ASSERT(num_max_tensor_bytes * num_max_inflight_tensors * 2 * 2 <= num_buffer_bytes);
+        // PP signals sit after the per-rank barrier signals, which the unordered GIN layout does not provision
+        EP_HOST_ASSERT(not nccl_context->use_unordered_hybrid_kernel and
+                       "PP send/recv is not supported with EP_HYBRID_KERNEL=unordered");
         this->prev_rank_idx = (nccl_context->rank_idx + nccl_context->num_ranks - 1) % nccl_context->num_ranks;
         this->next_rank_idx = (nccl_context->rank_idx + 1) % nccl_context->num_ranks;
         this->num_max_pp_tensor_bytes = math::align<int64_t>(num_max_tensor_bytes, 32);
@@ -602,14 +625,27 @@ public:
             // Hybrid dispatch
             const auto scaleup_recv_buffer = layout::BufferLayout<false>(
                 token_layout, num_scaleup_ranks, num_scaleout_ranks * num_max_tokens_per_rank);
-            const auto scaleout_send_buffer = layout::BufferLayout<false>(
-                token_layout, 1, num_max_tokens_per_rank);
-            const auto scaleout_recv_buffer = layout::BufferLayout<false>(
-                token_layout, num_scaleout_ranks,
-                /* kNumChannels * kNumMaxTokensPerChannel */ num_max_tokens_per_rank + kNumMaxChannels);
-            return scaleup_recv_buffer.get_num_bytes() +
-                   scaleout_send_buffer.get_num_bytes() +
-                   scaleout_recv_buffer.get_num_bytes();
+            int64_t num_scaleout_bytes;
+            if (elastic::use_unordered_hybrid_kernel()) {
+                const auto scaleout_token_layout_unordered = layout::TokenLayoutUnordered(
+                    hidden * elem_size, num_sf_packs * sizeof(sf_pack_t), num_topk, true);
+                const int num_scaleout_slots_unordered =
+                    num_max_tokens_per_rank + kNumMaxChannels * elastic::gin_alloc::kScaleoutSlotRoundingReserve;
+                const auto scaleout_buffer_unordered = layout::BufferLayoutUnordered<false>(
+                    scaleout_token_layout_unordered, num_scaleout_ranks, num_scaleout_slots_unordered);
+                // TX and RX buffers are fully symmetric, so the footprint is simply twice one buffer
+                num_scaleout_bytes = 2 * scaleout_buffer_unordered.get_num_bytes();
+            } else {
+                const auto scaleout_send_buffer = layout::BufferLayout<false>(
+                    token_layout, 1, num_max_tokens_per_rank);
+                const auto scaleout_recv_buffer = layout::BufferLayout<false>(
+                    token_layout, num_scaleout_ranks,
+                    /* kNumChannels * kNumMaxTokensPerChannel */ num_max_tokens_per_rank + kNumMaxChannels);
+                // TX and RX buffers differ: the transfer is a scatter, not a plain copy, as a token at its token
+                // index in the source buffer lands at a per-channel slot offset in the destination buffer
+                num_scaleout_bytes = scaleout_send_buffer.get_num_bytes() + scaleout_recv_buffer.get_num_bytes();
+            }
+            return scaleup_recv_buffer.get_num_bytes() + num_scaleout_bytes;
         }
     }
 
@@ -634,18 +670,28 @@ public:
         } else {
             // Hybrid combine
             const int num_tokens_in_scaleup_layout = allow_multiple_reduction ? std::min(num_scaleup_ranks, num_topk) : num_topk;
-            const int num_tokens_in_scaleout_layout = allow_multiple_reduction ? std::min(num_scaleout_ranks, num_topk) : num_topk;
             const auto scaleup_recv_buffer = layout::BufferLayout<false>(
                 token_layout, num_tokens_in_scaleup_layout, num_scaleout_ranks * num_max_tokens_per_rank);
-            const auto scaleout_recv_buffer = layout::BufferLayout<false>(
-                token_layout, num_tokens_in_scaleout_layout, num_max_tokens_per_rank);
-            const auto scaleout_send_buffer = layout::BufferLayout<false>(
-                token_layout, allow_multiple_reduction ? 1 : num_topk,
-                /* kNumChannels * num_scaleout_ranks * kNumMaxTokensPerChannel */
-                num_scaleout_ranks * (num_max_tokens_per_rank + kNumMaxChannels));
-            return scaleup_recv_buffer.get_num_bytes() +
-                   scaleout_send_buffer.get_num_bytes() +
-                   scaleout_recv_buffer.get_num_bytes();
+            int64_t num_scaleout_bytes;
+            if (elastic::use_unordered_hybrid_kernel()) {
+                const auto scaleout_buffer_unordered = layout::BufferLayout<false>(
+                    token_layout, num_scaleout_ranks,
+                    (num_max_tokens_per_rank + kNumMaxChannels) * (allow_multiple_reduction ? 1 : num_topk));
+                // TX and RX buffers are fully symmetric, so the footprint is simply twice one buffer
+                num_scaleout_bytes = 2 * scaleout_buffer_unordered.get_num_bytes();
+            } else {
+                const int num_tokens_in_scaleout_layout = allow_multiple_reduction ? std::min(num_scaleout_ranks, num_topk) : num_topk;
+                const auto scaleout_recv_buffer = layout::BufferLayout<false>(
+                    token_layout, num_tokens_in_scaleout_layout, num_max_tokens_per_rank);
+                const auto scaleout_send_buffer = layout::BufferLayout<false>(
+                    token_layout, allow_multiple_reduction ? 1 : num_topk,
+                    /* kNumChannels * num_scaleout_ranks * kNumMaxTokensPerChannel */
+                    num_scaleout_ranks * (num_max_tokens_per_rank + kNumMaxChannels));
+                // TX and RX buffers differ: the transfer is a scatter, not a plain copy, as a token from a
+                // source slot lands at a different offset (its token index) in the destination buffer
+                num_scaleout_bytes = scaleout_send_buffer.get_num_bytes() + scaleout_recv_buffer.get_num_bytes();
+            }
+            return scaleup_recv_buffer.get_num_bytes() + num_scaleout_bytes;
         }
     }
 
@@ -698,6 +744,7 @@ public:
                torch::Tensor, torch::Tensor, torch::Tensor,
                torch::Tensor, torch::Tensor,
                std::optional<torch::Tensor>, std::optional<torch::Tensor>,
+               std::optional<torch::Tensor>,
                std::optional<EventHandle>>
     dispatch(const torch::Tensor& x,
              const std::optional<torch::Tensor>& sf,
@@ -714,6 +761,7 @@ public:
              const std::optional<torch::Tensor>& cached_token_metadata_at_forward,
              const std::optional<torch::Tensor>& cached_recv_src_metadata,
              const std::optional<torch::Tensor>& cached_channel_linked_list,
+             const std::optional<torch::Tensor>& cached_token_map_at_dispatch,
              const int& num_max_tokens_per_rank,
              const int& num_experts, const int& expert_alignment,
              const int& num_sms, const int& num_qps,
@@ -744,6 +792,8 @@ public:
             if (nccl_context->num_scaleout_ranks > 1) {
                 EP_HOST_ASSERT(cached_token_metadata_at_forward.has_value());
                 EP_HOST_ASSERT(cached_channel_linked_list.has_value());
+                if (nccl_context->use_unordered_hybrid_kernel)
+                    EP_HOST_ASSERT(cached_token_map_at_dispatch.has_value());
             }
         }
 
@@ -857,10 +907,45 @@ public:
             num_channels_per_sm = std::min<int>(
                 num_smem_bytes / combine_token_layout.get_num_bytes<true>(),
                 num_channels_per_sm);
-            num_channels_per_sm = std::min<int>(
-                /* 2 kinds of warps */ num_channels_per_sm / 2, kNumMaxChannelsPerSM);
-            if (not prefer_overlap_with_compute)
-                num_channels_per_sm = std::min<int>(num_channels_per_sm, 4);
+            if (nccl_context->use_unordered_hybrid_kernel) {
+                const int dispatch_buffers_per_channel = prefer_overlap_with_compute
+                    ? kNumDispatchSendBuffers + 1
+                    : kNumDispatchBuffersPerChannel;
+                num_channels_per_sm = std::min<int>(
+                    num_channels_per_sm / dispatch_buffers_per_channel, kNumMaxChannelsPerSM);
+                EP_HOST_ASSERT(static_cast<int64_t>(dispatch_buffers_per_channel) * num_channels_per_sm *
+                                       dispatch_token_layout.get_num_bytes<true>() +
+                                   get_num_notify_smem_bytes(nccl_context->num_ranks, num_experts) <=
+                               num_smem_bytes and
+                               "dispatch TMA pool exceeds the shared-memory budget");
+                if (not prefer_overlap_with_compute)
+                    num_channels_per_sm = std::min<int>(num_channels_per_sm, 4);
+                // `with_notify` is pinned so that a cached dispatch derives the same count as its handle
+                if (num_sms > 0 and nccl_context->gin_config_unordered.gin_indexed_signals_cnt > 0) {
+                    if (get_env<int>("EP_BUFFER_DEBUG"))
+                        printf("[DEBUG] DeepEP GIN requested channels per SM: %d\n", num_channels_per_sm);
+                    num_channels_per_sm = elastic::gin_alloc::constexpr_channels_per_sm(
+                        nccl_context->gin_config_unordered.gin_indexed_signals_cnt,
+                        num_sms, num_qps, /*with_notify=*/true, num_channels_per_sm);
+                    if (get_env<int>("EP_BUFFER_DEBUG"))
+                        printf("[DEBUG] DeepEP GIN resolved channels per SM: %d\n", num_channels_per_sm);
+                }
+                // The combine proxy rings share the dynamic shared memory with its TMA buffers
+                while (num_channels_per_sm > 1 and
+                       static_cast<int64_t>(2 * num_channels_per_sm) *
+                               combine_token_layout.get_num_bytes<true, int64_t>() +
+                           elastic::ProxyRingLayout::get_num_bytes(num_channels_per_sm,
+                                                                   elastic::kProxyRingDepthDefault) >
+                       num_smem_bytes)
+                    -- num_channels_per_sm;
+                EP_HOST_ASSERT(num_channels_per_sm >= 1 and
+                               "shared memory cannot host a single dispatch channel at this token size");
+            } else {
+                num_channels_per_sm = std::min<int>(
+                    /* 2 kinds of warps */ num_channels_per_sm / 2, kNumMaxChannelsPerSM);
+                if (not prefer_overlap_with_compute)
+                    num_channels_per_sm = std::min<int>(num_channels_per_sm, 4);
+            }
             num_channels = num_sms * num_channels_per_sm;
             if (get_env<int>("EP_BUFFER_DEBUG"))
                 printf("Elastic buffer uses %d channels per SM\n", num_channels_per_sm);
@@ -882,8 +967,9 @@ public:
         }
 
         // Hybrid mode handles
-        std::optional<torch::Tensor> token_metadata_at_forward, channel_linked_list;
+        std::optional<torch::Tensor> token_metadata_at_forward, channel_linked_list, token_map_at_dispatch;
         int *token_metadata_at_forward_ptr = nullptr, *channel_linked_list_ptr = nullptr;
+        int *token_map_at_dispatch_ptr = nullptr;
         if (nccl_context->num_scaleout_ranks > 1) {
             // The token destination slot idx during forward
             // `[i, j, k, l]` means: from channel i from scale-out peer k, the j-th token's index in the l-th rank buffer
@@ -949,6 +1035,23 @@ public:
                 );
             }
             channel_linked_list_ptr = channel_linked_list->data_ptr<int>();
+
+            // Per-(token, k) recv address map
+            if (nccl_context->use_unordered_hybrid_kernel) {
+                if (cached_mode) {
+                    token_map_at_dispatch = cached_token_map_at_dispatch;
+                    const auto [num_max_tokens_per_rank_, num_topk_] = get_shape<2>(token_map_at_dispatch.value());
+                    EP_HOST_ASSERT(num_max_tokens_per_rank == num_max_tokens_per_rank_ and num_topk == num_topk_);
+                    EP_HOST_ASSERT(token_map_at_dispatch->is_cuda() and token_map_at_dispatch->is_contiguous());
+                    EP_HOST_ASSERT(token_map_at_dispatch->scalar_type() == torch::kInt);
+                } else {
+                    token_map_at_dispatch = torch::empty(
+                        {num_max_tokens_per_rank, num_topk},
+                        torch::TensorOptions().device(torch::kCUDA).dtype(torch::kInt)
+                    );
+                }
+                token_map_at_dispatch_ptr = token_map_at_dispatch->data_ptr<int>();
+            }
         }
 
         // Clone `topk_idx` for saving in the handle (to prevent users' modification)
@@ -975,6 +1078,15 @@ public:
         std::fill_n(host_workspace_layout.get_scaleup_expert_count_ptr<false>(), num_local_experts, 0);
         std::atomic_thread_fence(std::memory_order_seq_cst);
 
+        UnorderedDispatchExtendedArgs unordered_args = {};
+        if (nccl_context->use_unordered_hybrid_kernel) {
+            unordered_args = {
+                .token_map_at_dispatch = token_map_at_dispatch_ptr,
+                .gin_indexed_signals_cnt = nccl_context->gin_config_unordered.gin_indexed_signals_cnt,
+                .double_buffer_forward = not prefer_overlap_with_compute,
+                .allow_multiple_reduction = allow_multiple_reduction, .do_expand = do_expand};
+        }
+
         // Do dispatch into the buffers (with SM limitation)
         EP_HOST_ASSERT(num_sms <= jit::device_runtime->get_num_sms());
         launch_dispatch(x.data_ptr(), sf_ptr,
@@ -1000,7 +1112,8 @@ public:
                         num_smem_bytes,
                         num_qps, num_gpu_timeout_cycles,
                         cached_mode, do_cpu_sync,
-                        comm_stream);
+                        comm_stream,
+                        nccl_context->use_unordered_hybrid_kernel ? &unordered_args : nullptr);
 
         // Received token counters
         int num_recv_tokens = 0, num_expanded_tokens = 0;
@@ -1157,7 +1270,8 @@ public:
              recv_src_metadata,
              dst_buffer_slot_idx,
              token_metadata_at_forward,
-             channel_linked_list},
+             channel_linked_list,
+             token_map_at_dispatch},
             compute_stream,
             allocate_on_comm_stream, async_with_compute_stream);
 
@@ -1173,6 +1287,7 @@ public:
                 dst_buffer_slot_idx,
                 token_metadata_at_forward,
                 channel_linked_list,
+                token_map_at_dispatch,
                 event};
     }
 
@@ -1186,6 +1301,7 @@ public:
             const torch::Tensor& psum_num_recv_tokens_per_scaleup_rank,
             const std::optional<torch::Tensor>& token_metadata_at_forward,
             const std::optional<torch::Tensor>& channel_linked_list,
+            const std::optional<torch::Tensor>& token_map_at_dispatch,
             const int& num_experts,
             const int& num_max_tokens_per_rank,
             const int& num_sms, const int& num_qps,
@@ -1259,6 +1375,7 @@ public:
         int num_channels = 1;
         int* token_metadata_at_forward_ptr = nullptr;
         int* channel_linked_list_ptr = nullptr;
+        int* token_map_at_dispatch_ptr = nullptr;
         if (nccl_context->num_scaleout_ranks > 1) {
             // The token metadata during forward
             const auto [num_channels_, d1, d2] = get_shape<3>(token_metadata_at_forward.value());
@@ -1278,6 +1395,24 @@ public:
             EP_HOST_ASSERT(d2_ == nccl_context->num_scaleup_ranks);
             EP_HOST_ASSERT(channel_linked_list->is_cuda() and channel_linked_list->is_contiguous());
             EP_HOST_ASSERT(channel_linked_list->scalar_type() == torch::kInt);
+
+            // Per-(token, k) recv address map
+            if (nccl_context->use_unordered_hybrid_kernel) {
+                EP_HOST_ASSERT(token_map_at_dispatch.has_value());
+                const auto [num_max_tokens_per_rank_, num_topk_] = get_shape<2>(token_map_at_dispatch.value());
+                EP_HOST_ASSERT(num_max_tokens_per_rank == num_max_tokens_per_rank_ and num_topk == num_topk_);
+                EP_HOST_ASSERT(token_map_at_dispatch->is_cuda() and token_map_at_dispatch->is_contiguous());
+                EP_HOST_ASSERT(token_map_at_dispatch->scalar_type() == torch::kInt);
+                token_map_at_dispatch_ptr = token_map_at_dispatch->data_ptr<int>();
+            }
+        }
+
+        UnorderedCombineExtendedArgs unordered_args = {};
+        if (nccl_context->use_unordered_hybrid_kernel) {
+            unordered_args = {
+                .token_map_at_dispatch = token_map_at_dispatch_ptr,
+                .num_combined_tokens = num_combined_tokens,
+                .num_channels = num_channels};
         }
 
         // Push data into remote buffers
@@ -1300,7 +1435,8 @@ public:
             num_sms, jit::device_runtime->get_num_smem_bytes(),
             num_channels,
             use_expanded_layout, allow_multiple_reduction,
-            comm_stream);
+            comm_stream,
+            nccl_context->use_unordered_hybrid_kernel ? &unordered_args : nullptr);
 
         // Allocate output tensors
         auto combined_x = torch::empty({num_combined_tokens, hidden}, x.options());
@@ -1326,7 +1462,8 @@ public:
                                        jit::device_runtime->get_num_sms(),
                                        jit::device_runtime->get_num_smem_bytes(),
                                        use_expanded_layout, allow_multiple_reduction,
-                                       comm_stream);
+                                       comm_stream,
+                                       nccl_context->use_unordered_hybrid_kernel ? &unordered_args : nullptr);
 
         // Stream control
         const auto event = stream_control_epilogue(
@@ -1336,7 +1473,8 @@ public:
              combined_x, combined_topk_weights,
              psum_num_recv_tokens_per_scaleup_rank,
              token_metadata_at_forward,
-             channel_linked_list},
+             channel_linked_list,
+             token_map_at_dispatch},
             compute_stream,
             allocate_on_comm_stream, async_with_compute_stream);
         return {combined_x, combined_topk_weights, event};
@@ -1349,6 +1487,7 @@ static void register_apis(pybind11::module_& m) {
         .def("destroy", &ElasticBuffer::destroy)
         .def("get_comm_stream", &ElasticBuffer::get_comm_stream)
         .def("get_physical_domain_size", &ElasticBuffer::get_physical_domain_size)
+        .def("get_num_allocated_qps", &ElasticBuffer::get_num_allocated_qps)
         .def("get_logical_domain_size", &ElasticBuffer::get_logical_domain_size)
         .def("barrier", &ElasticBuffer::barrier)
         .def("engram_write", &ElasticBuffer::engram_write)

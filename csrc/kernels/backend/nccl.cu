@@ -1,3 +1,14 @@
+// MIT License
+//
+// Copyright (c) 2025 DeepSeek
+// Changes and additions copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
 #include <cstring>
 #include <vector>
 #include <string>
@@ -10,6 +21,8 @@
 
 #include <deep_ep/common/compiled.cuh>
 #include <deep_ep/common/exception.cuh>
+#include "../elastic/kernel_select.hpp"
+#include "gin_unordered.hpp"
 
 #include "api.cuh"
 #include "../../utils/system.hpp"
@@ -64,7 +77,8 @@ NCCLSymmetricMemoryContext::NCCLSymmetricMemoryContext(const int64_t& nccl_comm,
                                                        const int64_t& num_bytes, const int64_t& num_cpu_bytes,
                                                        const bool& allow_hybrid_mode,
                                                        const int& sl_idx, const int& num_allocated_qps):
-    rank_idx(rank_idx), num_ranks(num_ranks), num_allocated_qps(num_allocated_qps) {
+    rank_idx(rank_idx), num_ranks(num_ranks), num_allocated_qps(num_allocated_qps),
+    use_unordered_hybrid_kernel(allow_hybrid_mode and elastic::use_unordered_hybrid_kernel()) {
     int nccl_runtime_version;
     NCCL_CHECK(ncclGetVersion(&nccl_runtime_version));
     if (get_env("EP_BUFFER_DEBUG", 0)) {
@@ -96,6 +110,11 @@ NCCLSymmetricMemoryContext::NCCLSymmetricMemoryContext(const int64_t& nccl_comm,
         // Customized RDMA barrier needs extra signals
         reqs.ginSignalCount = num_ranks + 2 * 2;
         reqs.ginConnectionType = allow_hybrid_mode ? NCCL_GIN_CONNECTION_RAIL: NCCL_GIN_CONNECTION_FULL;
+    }
+    if (use_unordered_hybrid_kernel) {
+        gin_config_unordered = elastic::configure_unordered_gin(comm, reqs, num_ranks,
+                                                                num_ranks > 1 and get_env("EP_DISABLE_GIN", 0) == 0,
+                                                                this->num_allocated_qps);
     }
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 31, 0)
     reqs.useRuntimeVersion = true;

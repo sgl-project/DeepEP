@@ -341,6 +341,7 @@ The library provides some environment variables, which may be useful:
     - `EP_NIC_NAME`: string, the default NIC name used to query NIC properties, `mlx5_0` by default
     - `EP_OVERRIDE_RDMA_SL`: integer, override the RDMA service level index for traffic isolation
     - `EP_DISABLE_GIN`: `0` or `1`, disable the NCCL Gin backend (fall back to non-Gin path), `0` by default
+    - `EP_HYBRID_KERNEL`: `ordered` or `unordered`, select the hybrid (scale-out) dispatch/combine kernel pair, `ordered` by default. See [Hybrid kernel variants](#hybrid-kernel-variants-ordered-and-unordered)
 - JIT
     - `EP_JIT_DEBUG`: `0` or `1`, print JIT debugging information, `0` by default
     - `EP_JIT_CACHE_DIR`: string, cache directory for compiled kernels, `$HOME/.deep_ep` by default
@@ -355,6 +356,8 @@ The library provides some environment variables, which may be useful:
     - `EP_JIT_DUMP_SASS`: `0` or `1`, dump SASS output, `0` by default
 - Debug and profiling
     - `EP_GIN_GDAKI_DEBUG`: `0` or `1`, enable NCCL Gin GDAKI debugging output, `0` by default
+    - `EP_DEBUG_CHECKS`: debug checks compiled into the kernels, off when unset or `0`. `1` or `all` turns on every check, a comma-separated list of the names below turns on single checks
+        - `queue`: after a network wait of the unordered kernels times out, a short timed flush of the waiting warp's GIN context prints whether this rank's NIC had completed every write posted on it (`NIC drained: 1`) or still held some (`0`). GIN flush timeouts then also print the context id and wait one second before trapping
     - `EP_USE_NVIDIA_TOOLS`: `0` or `1`, skip internal profiling when running under external NVIDIA tools, `0` by default
     - `EP_DISABLE_BARRIER_PROFILING`: `0` or `1`, disable barrier-based communication profiling in benchmarks, `0` by default
 - Build
@@ -398,6 +401,28 @@ If the hardware supports it, we recommend using the following command to set the
 ```bash
 sudo mlxconfig -y -d mlx5_$i set PCI_ATOMIC_MODE=4
 ```
+
+## Hybrid kernel variants (ordered and unordered)
+
+`EP_HYBRID_KERNEL` selects the hybrid (scale-out) dispatch and combine kernels and the preparation around them. Direct mode is not affected by this setting.
+
+- `EP_HYBRID_KERNEL=ordered` (default). Assumes the network delivers data in order, and is built around NCCL GIN strong signals.
+- `EP_HYBRID_KERNEL=unordered`. Makes no assumption about delivery order, and is built around NCCL GIN weak signals. Requires NCCL 2.31.2 or later.
+
+## Running on AWS EFA
+
+On EFA the traffic is carried by an NCCL GIN backend provided by the [aws-ofi-nccl](https://github.com/aws/aws-ofi-nccl) plugin. Two backends are available:
+
+- **EFA-GDA** (GPU-initiated). The NIC work queues are mapped into GPU memory and the kernels post RDMA operations themselves.
+- **CPU proxy**. The GPU hands work descriptors to a CPU proxy thread that posts the RDMA operations.
+
+Enabling NCCL GIN backends on AWS has different requirements, see details in this [document](https://github.com/aws/aws-ofi-nccl/blob/master/doc/gin-getting-started.md).
+
+### Benchmarking on EFA
+
+A ready-to-run setup (install script, reference Dockerfile, and Slurm launchers for intra-node and inter-node `test_ep.py` runs) is maintained in the awsome-distributed-ai repository:
+
+- [DeepEP V2 Benchmark (NCCL GIN / EFA-GDA)](https://github.com/awslabs/awsome-distributed-ai/blob/main/micro-benchmarks/expert-parallelism/deepep-v2-benchmark/README.md)
 
 ## Experimental branches
 
